@@ -1,4 +1,6 @@
 build/
+.idea/
+.DS_Store
 bench_runs/
 bench_db/
 bench_scan_smoke/
