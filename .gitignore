@@ -1,0 +1,9 @@
+build/
+bench_runs/
+bench_db/
+bench_scan_smoke/
+demo_db/
+test/test_dbs/
+test_db_*/
+*.tmp
+*.log
