@@ -152,6 +152,23 @@ db_size_bytes: ...
 
 内部测试统计还覆盖 `sstable_full_scans` 与 `block_restart_seeks`，用于防止 compaction 回退到全表 materialize，以及防止 prefix-compressed block 读取绕过 restart point seek。
 
+### Benchmark 结果
+
+单线程，100K 操作，value 100 字节，macOS Apple Silicon：
+
+| 场景 | QPS | 平均延迟 | 说明 |
+|---|---|---|---|
+| 写入 | 21,800 | 46 μs | WAL fsync + MemTable + Flush |
+| 顺序读 | 13,100 | 76 μs | MemTable → SSTable + Block Cache |
+| 随机读 | 11,600 | 86 μs | Bloom Filter 过滤 + Block Cache |
+| 范围扫描 | 294,000 | 3.4 μs | MergingIterator 流式遍历 |
+| 混合读写 | 16,800 | 60 μs | 50% 写 + 50% 读 |
+
+观察：
+- 范围扫描吞吐最高，因为是纯内存顺序遍历，几乎没有磁盘 IO
+- 随机读比顺序读慢，因为 Bloom Filter 误判时需要额外磁盘读取
+- 写入受 WAL fsync 限制，每次写入都要持久化
+
 ## 面试讲解建议
 
 详细讲法见 [docs/INTERVIEW.md](docs/INTERVIEW.md)。建议重点讲 4 条线：
