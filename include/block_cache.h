@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <list>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -40,6 +41,7 @@ class BlockCache {
   using EntryList = std::list<std::pair<Key, std::string>>;
 
   size_t capacity_;
+  mutable std::mutex mutex_;
   EntryList entries_;
   std::unordered_map<Key, EntryList::iterator, KeyHash> index_;
   BlockCacheStats stats_;

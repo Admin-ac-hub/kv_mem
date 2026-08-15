@@ -83,7 +83,7 @@ LSM-Tree 中删除不直接删，而是写一条 `deleted=true` 的记录。
 
 原因：SSTable 是只读的，没法回去改旧文件。
 
-读取时：迭代器从新到旧扫，先看到 tombstone 就知道 key 被删了。
+点查会先查较新的 MemTable/SSTable，遇到最新可见 tombstone 就停止并返回未找到；范围迭代器则归并各层版本，再按 sequence 过滤 tombstone 和旧值。
 
 物理删除：在 Compaction（压缩合并）时清理。
 
@@ -107,7 +107,7 @@ LSM-Tree 中删除不直接删，而是写一条 `deleted=true` 的记录。
 | MemTable | 内存 | 跳表，支持有序插入和查找 |
 | SSTable | 磁盘 | 排好序的不可变文件，分层 |
 
-InternalIterator 是整个 LSM-Tree 的遍历抽象，每层都实现这个接口，上层用 MergeIterator 归并。
+InternalIterator 是 LSM-Tree 的统一遍历协议。DB 为 MemTable 和 SSTable 创建对应的 child iterator，再由 MergingIterator 做多路归并。
 
 ---
 
@@ -162,7 +162,7 @@ Level 0:  head -> 10 -> 15 -> 20 -> 30 -> 40 -> 50 -> 70 -> NULL
 
 插入时用 `RandomLevel()` 决定节点层数（50% 概率晋升），靠概率自动保持平衡。
 
-对比红黑树：实现简单、范围遍历天然支持（链表）、并发友好。
+对比红黑树：实现简单，底层链表天然支持范围遍历。当前 SkipList 本身不负责同步，并发安全由 DB 外层的 `memtable_mu_` 保证。
 
 ---
 
@@ -289,36 +289,3 @@ unshared = 自己独有的部分
 ### 在 SSTable 中的位置
 
 每个 SSTable 文件末尾自带一个，读取时先加载到内存，查询前先 MayContain 过滤。
-
----
-
-### 已学习（自行学习）
-
-- Block Cache（块缓存）✅
-- Compression（压缩）✅
-- WAL（预写日志）✅
-- Write Batch（批量写入）✅
-- Manifest（清单文件）✅
-- Format（编码工具）✅
-
-### 待学习
-
-- DB（主接口）
-- sstable.cpp 完整实现（之前只讲了部分）
-- kv_bench.cpp（基准测试）
-
----
-
-## 工厂方法模式
-
-用 static 方法封装对象构造，比直接用构造函数语义更清晰：
-
-```cpp
-Status s = Status::NotFound("key not found");  // 好读
-// vs
-Status s(Status::Code::kNotFound, "key not found");  // 容易写错
-```
-
-## Hook（钩子）
-
-在特定事件发生时自动执行的脚本。Claude Code 的插件通过 Hook 注入行为（如 SessionStart、UserPromptSubmit）。

@@ -23,8 +23,4 @@ size_t MemTable::Size() const {
   return table_.Size();
 }
 
-void MemTable::Clear() {
-  table_.Clear();
-}
-
 }  // namespace kv

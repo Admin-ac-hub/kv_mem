@@ -1,11 +1,12 @@
 build/
+/build-bench/
+/cmake-build-*/
+/.VSCodeCounter/
 .idea/
 .DS_Store
 bench_runs/
+stress_runs/
 bench_db/
-bench_scan_smoke/
-demo_db/
 test/test_dbs/
-test_db_*/
 *.tmp
 *.log

@@ -19,28 +19,18 @@ namespace kv {
 
 namespace {
 
-bool ContainsSSTableSeparator(const std::string& value) {
-  return value.find('\t') != std::string::npos ||
-         value.find('\n') != std::string::npos ||
-         value.find('\0') != std::string::npos;
+bool ContainsInvalidKeyByte(const std::string& key) {
+  return key.find('\t') != std::string::npos ||
+         key.find('\n') != std::string::npos ||
+         key.find('\0') != std::string::npos;
 }
 
 Status ValidateKey(const std::string& key) {
   if (key.empty()) {
     return Status::InvalidArgument("key cannot be empty");
   }
-  if (ContainsSSTableSeparator(key)) {
-    return Status::InvalidArgument("key cannot contain tab or newline");
-  }
-  return Status::OK();
-}
-
-Status ValidateValue(const std::string& value) {
-  if (ContainsSSTableSeparator(value)) {
-    return Status::InvalidArgument("value cannot contain tab or newline");
-  }
-  if (value == SSTable::kTombstoneValue) {
-    return Status::InvalidArgument("value is reserved for tombstone");
+  if (ContainsInvalidKeyByte(key)) {
+    return Status::InvalidArgument("key cannot contain tab, newline, or NUL");
   }
   return Status::OK();
 }
@@ -64,13 +54,6 @@ class VectorInternalIterator : public InternalIterator {
         entries_.push_back(std::move(entry));
       }
     }
-    std::sort(entries_.begin(), entries_.end(),
-              [](const VersionedEntry& lhs, const VersionedEntry& rhs) {
-                if (lhs.key != rhs.key) {
-                  return lhs.key < rhs.key;
-                }
-                return lhs.sequence > rhs.sequence;
-              });
   }
 
   void SeekToFirst() override {
@@ -343,6 +326,7 @@ Status DB::Open() {
   }
   background_status_ = Status::OK();
   active_wal_file_number_ = 1;
+  active_memtable_oldest_wal_file_number_ = 1;
 
   Status status = LoadOrRecoverManifest();
   if (!status.ok()) {
@@ -382,6 +366,7 @@ Status DB::Close() {
     return background_status_;
   }
 
+  bool moved_active_memtable = false;
   {
     std::unique_lock<std::shared_mutex> memtable_lock(memtable_mu_);
     if (active_memtable_ != nullptr && active_memtable_->Size() > 0) {
@@ -390,8 +375,10 @@ Status DB::Close() {
         wal_.reset();
       }
       immutable_memtables_.push_back(
-          ImmutableMemTable{std::move(active_memtable_), active_wal_file_number_});
+          ImmutableMemTable{std::move(active_memtable_),
+                            active_memtable_oldest_wal_file_number_});
       active_memtable_ = std::make_shared<MemTable>();
+      moved_active_memtable = true;
     } else if (wal_ != nullptr) {
       wal_->Close();
     }
@@ -418,11 +405,15 @@ Status DB::Close() {
   if (status.ok() && !immutable_memtables_.empty()) {
     status = Status::IOError("background flush did not drain all immutable memtables");
   }
-  if (status.ok() && active_memtable_ != nullptr && active_memtable_->Size() == 0) {
+  if (status.ok() && moved_active_memtable) {
     const std::uint64_t next_wal_file_number = manifest_->AllocateFileNumber();
     manifest_->SetWALFileNumber(next_wal_file_number);
     active_wal_file_number_ = next_wal_file_number;
+    active_memtable_oldest_wal_file_number_ = next_wal_file_number;
     status = SaveManifest();
+    if (status.ok()) {
+      status = RemoveObsoleteWALFiles(next_wal_file_number);
+    }
   }
   closed_ = true;
   return status;
@@ -449,11 +440,6 @@ Status DB::Write(const WriteBatch& batch) {
     }
     switch (operation.type) {
       case WriteBatchOpType::kPut:
-        status = ValidateValue(operation.value);
-        if (!status.ok()) {
-          return status;
-        }
-        break;
       case WriteBatchOpType::kDelete:
         break;
       default:
@@ -517,6 +503,10 @@ Status DB::Get(const std::string& key, std::string* value, const ReadOptions& op
       immutable_memtables.push_back(immutable.memtable);
     }
     sstables = sstables_;
+  }
+
+  if (options_.testing_after_read_version_pin) {
+    options_.testing_after_read_version_pin();
   }
 
   {
@@ -714,7 +704,7 @@ Status DB::CompactUnlocked() {
               });
 
     if (min_snapshot == 0) {
-      if (!versions.front().deleted) {
+      if (!versions.front().deleted || target_level < 2) {
         output.push_back(std::move(versions.front()));
       }
       continue;
@@ -741,7 +731,7 @@ Status DB::CompactUnlocked() {
   const std::vector<std::shared_ptr<SSTable>> old_tables = sstables_;
   const std::uint64_t new_file_number = manifest_->AllocateFileNumber();
   const std::filesystem::path new_path = SSTablePath(new_file_number);
-  Status status = SSTable::CreateFromEntries(new_file_number, new_path, output,
+  Status status = SSTable::CreateFromEntries(new_path, output,
                                              options_.block_size,
                                              options_.bloom_bits_per_key);
   if (!status.ok()) {
@@ -814,7 +804,7 @@ DBStats DB::Stats() const {
   DBStats stats;
   stats.sstable_count = sstables_.size();
   stats.compaction_count = compaction_count_;
-  stats.sstable_full_scans = SSTable::TotalFullScanCount();
+  stats.sstable_full_scans = sstable_full_scans_;
   for (const auto& meta : manifest_->SSTables()) {
     if (meta.level == 0) {
       ++stats.level0_sstable_count;
@@ -845,6 +835,7 @@ Status DB::LoadOrRecoverManifest() {
   VersionEdit edit;
   std::vector<SSTableMeta> tables;
   std::uint64_t max_sstable_number = 0;
+  std::uint64_t min_wal_number = std::numeric_limits<std::uint64_t>::max();
   std::uint64_t max_wal_number = 0;
 
   for (const auto& entry : std::filesystem::directory_iterator(options_.db_path)) {
@@ -866,8 +857,10 @@ Status DB::LoadOrRecoverManifest() {
       tables.push_back(std::move(meta));
       max_sstable_number = std::max(max_sstable_number, number);
     } else if (ParseWALFileName(entry.path(), &number)) {
+      min_wal_number = std::min(min_wal_number, number);
       max_wal_number = std::max(max_wal_number, number);
     } else if (entry.path().filename() == "wal.log") {
+      min_wal_number = std::min<std::uint64_t>(min_wal_number, 1);
       max_wal_number = std::max<std::uint64_t>(max_wal_number, 1);
     }
   }
@@ -884,6 +877,7 @@ Status DB::LoadOrRecoverManifest() {
       return status;
     }
     std::vector<VersionedEntry> entries;
+    ++sstable_full_scans_;
     status = table->Entries(&entries);
     if (!status.ok()) {
       return status;
@@ -902,10 +896,11 @@ Status DB::LoadOrRecoverManifest() {
     }
   }
   if (max_wal_number == 0) {
+    min_wal_number = 1;
     max_wal_number = 1;
   }
   edit.sstables = std::move(tables);
-  edit.wal_file_number = max_wal_number;
+  edit.wal_file_number = min_wal_number;
   edit.last_sequence = max_sequence;
   edit.next_file_number = max_sstable_number + 1;
   edit.next_file_number = std::max(edit.next_file_number, max_wal_number + 1);
@@ -956,6 +951,8 @@ Status DB::Recover() {
             });
 
   active_wal_file_number_ = wal_files.empty() ? oldest_live_wal : wal_files.back().first;
+  active_memtable_oldest_wal_file_number_ =
+      wal_files.empty() ? oldest_live_wal : wal_files.front().first;
   if (manifest_->NextFileNumber() <= max_seen_file_number) {
     manifest_->SetNextFileNumber(max_seen_file_number + 1);
   }
@@ -1008,7 +1005,7 @@ Status DB::FlushMemTable() {
   }
 
   const VersionEdit old_edit = manifest_->CurrentEdit();
-  const std::uint64_t old_wal_number = active_wal_file_number_;
+  const std::uint64_t old_wal_number = active_memtable_oldest_wal_file_number_;
   const std::uint64_t new_wal_number = manifest_->AllocateFileNumber();
   LogEvent("memtable switch active WAL " + std::to_string(old_wal_number) +
            " -> " + std::to_string(new_wal_number));
@@ -1031,6 +1028,7 @@ Status DB::FlushMemTable() {
   immutable_memtables_.push_back(ImmutableMemTable{active_memtable_, old_wal_number});
   active_memtable_ = std::make_shared<MemTable>();
   active_wal_file_number_ = new_wal_number;
+  active_memtable_oldest_wal_file_number_ = new_wal_number;
   wal_ = std::move(new_wal);
   {
     std::lock_guard<std::mutex> bg_lock(bg_mu_);
@@ -1066,17 +1064,19 @@ void DB::BackgroundWorkerLoop() {
           return;
         }
 
-      immutable = immutable_memtables_.front();
-      sstable_number = manifest_->AllocateFileNumber();
-      LogEvent("flush start WAL " + std::to_string(immutable.wal_file_number) +
-               " -> SSTable " + std::to_string(sstable_number));
-    }
+        immutable = immutable_memtables_.front();
+        sstable_number = manifest_->AllocateFileNumber();
+        LogEvent("flush start WAL " + std::to_string(immutable.wal_file_number) +
+                 " -> SSTable " + std::to_string(sstable_number));
+      }
 
       std::shared_ptr<SSTable> table;
-      Status status = FlushImmutableMemTable(immutable, sstable_number, &table);
+      SSTableMeta table_meta;
+      Status status =
+          FlushImmutableMemTable(immutable, sstable_number, &table, &table_meta);
 
-      std::filesystem::path obsolete_wal;
-      bool remove_obsolete_wal = false;
+      std::uint64_t oldest_live_wal_after_flush = 0;
+      bool cleanup_obsolete_wals = false;
       {
         std::unique_lock<std::mutex> lock(version_mu_);
         if (!status.ok()) {
@@ -1093,11 +1093,13 @@ void DB::BackgroundWorkerLoop() {
         const VersionEdit old_edit = manifest_->CurrentEdit();
         const auto old_tables = sstables_;
         sstables_.push_back(table);
-        manifest_->SetSSTables(CurrentSSTableMetas());
+        std::vector<SSTableMeta> new_metas = old_edit.sstables;
+        new_metas.push_back(table_meta);
+        manifest_->SetSSTables(std::move(new_metas));
         const std::uint64_t next_live_wal =
             immutable_memtables_.size() > 1
                 ? immutable_memtables_[1].wal_file_number
-                : active_wal_file_number_;
+                : active_memtable_oldest_wal_file_number_;
         manifest_->SetWALFileNumber(next_live_wal);
 
         status = SaveManifest();
@@ -1108,9 +1110,9 @@ void DB::BackgroundWorkerLoop() {
           continue;
         }
 
-        obsolete_wal = WALPath(immutable.wal_file_number);
         immutable_memtables_.pop_front();
-        remove_obsolete_wal = true;
+        oldest_live_wal_after_flush = next_live_wal;
+        cleanup_obsolete_wals = true;
 
         status = MaybeCompact();
         if (!status.ok()) {
@@ -1118,11 +1120,8 @@ void DB::BackgroundWorkerLoop() {
         }
       }
 
-      if (remove_obsolete_wal) {
-        status = RemoveFileIfExists(obsolete_wal);
-        if (status.ok()) {
-          status = FsyncDirectory(options_.db_path);
-        }
+      if (cleanup_obsolete_wals) {
+        status = RemoveObsoleteWALFiles(oldest_live_wal_after_flush);
         if (!status.ok()) {
           std::lock_guard<std::mutex> lock(version_mu_);
           SetBackgroundErrorLocked(status);
@@ -1136,52 +1135,39 @@ void DB::BackgroundWorkerLoop() {
 
 Status DB::FlushImmutableMemTable(const ImmutableMemTable& immutable,
                                   std::uint64_t sstable_number,
-                                  std::shared_ptr<SSTable>* table) {
+                                  std::shared_ptr<SSTable>* table,
+                                  SSTableMeta* meta) {
   if (options_.testing_fail_flush) {
     return Status::IOError("injected flush failure");
   }
+  const std::vector<VersionedEntry> entries = immutable.memtable->Entries();
   const std::filesystem::path sstable_path = SSTablePath(sstable_number);
-  Status status = SSTable::CreateFromEntries(sstable_number, sstable_path,
-                                             immutable.memtable->Entries(),
+  Status status = SSTable::CreateFromEntries(sstable_path,
+                                             entries,
                                              options_.block_size,
                                              options_.bloom_bits_per_key);
   if (!status.ok()) {
     return status;
   }
 
-  return SSTable::Open(sstable_number, sstable_path, block_cache_, table);
-}
+  status = SSTable::Open(sstable_number, sstable_path, block_cache_, table);
+  if (!status.ok()) {
+    return status;
+  }
 
-SSTableMeta DB::BuildSSTableMeta(const std::shared_ptr<SSTable>& table, int level) const {
-  SSTableMeta meta;
-  meta.file_number = table->FileNumber();
-  meta.file_path = table->FilePath();
-  meta.level = level;
+  meta->file_number = (*table)->FileNumber();
+  meta->file_path = (*table)->FilePath();
+  meta->level = 0;
   std::error_code ec;
-  meta.file_size = std::filesystem::file_size(meta.file_path, ec);
+  meta->file_size = std::filesystem::file_size(meta->file_path, ec);
   if (ec) {
-    meta.file_size = 0;
+    meta->file_size = 0;
   }
-
-  std::vector<VersionedEntry> entries;
-  Status status = table->Entries(&entries);
-  if (status.ok() && !entries.empty()) {
-    auto minmax = std::minmax_element(
-        entries.begin(), entries.end(),
-        [](const VersionedEntry& lhs, const VersionedEntry& rhs) {
-          return lhs.key < rhs.key;
-        });
-    meta.smallest_key = minmax.first->key;
-    meta.largest_key = minmax.second->key;
+  if (!entries.empty()) {
+    meta->smallest_key = entries.front().key;
+    meta->largest_key = entries.back().key;
   }
-  return meta;
-}
-
-std::uint64_t DB::OldestLiveWALFileNumberLocked() const {
-  if (!immutable_memtables_.empty()) {
-    return immutable_memtables_.front().wal_file_number;
-  }
-  return active_wal_file_number_;
+  return Status::OK();
 }
 
 void DB::SetBackgroundErrorLocked(Status status) {
@@ -1276,6 +1262,30 @@ Status DB::SaveManifest() {
   return manifest_->Save(manifest_->CurrentEdit());
 }
 
+Status DB::RemoveObsoleteWALFiles(std::uint64_t oldest_live_wal) {
+  bool removed_any = false;
+  for (const auto& entry : std::filesystem::directory_iterator(options_.db_path)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+
+    std::uint64_t number = 0;
+    const bool numbered_wal = ParseWALFileName(entry.path(), &number);
+    const bool legacy_wal = entry.path().filename() == "wal.log";
+    if ((!numbered_wal || number >= oldest_live_wal) &&
+        (!legacy_wal || oldest_live_wal <= 1)) {
+      continue;
+    }
+
+    Status status = RemoveFileIfExists(entry.path());
+    if (!status.ok()) {
+      return status;
+    }
+    removed_any = true;
+  }
+  return removed_any ? FsyncDirectory(options_.db_path) : Status::OK();
+}
+
 void DB::LogEvent(const std::string& message) const {
   if (options_.enable_event_log) {
     std::clog << "[kvdb] " << message << '\n';
@@ -1288,24 +1298,6 @@ std::filesystem::path DB::SSTablePath(std::uint64_t number) const {
 
 std::filesystem::path DB::WALPath(std::uint64_t number) const {
   return options_.db_path / WALFileName(number);
-}
-
-std::vector<SSTableMeta> DB::CurrentSSTableMetas() const {
-  std::vector<SSTableMeta> metas;
-  metas.reserve(sstables_.size());
-  std::map<std::uint64_t, SSTableMeta> existing;
-  for (const auto& meta : manifest_->SSTables()) {
-    existing[meta.file_number] = meta;
-  }
-  for (const auto& table : sstables_) {
-    auto it = existing.find(table->FileNumber());
-    if (it != existing.end()) {
-      metas.push_back(it->second);
-    } else {
-      metas.push_back(BuildSSTableMeta(table, 0));
-    }
-  }
-  return metas;
 }
 
 }  // namespace kv

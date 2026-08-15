@@ -57,6 +57,43 @@ std::string BuildEditPayload(const VersionEdit& persisted, const VersionEdit& ne
   return out.str();
 }
 
+Status PersistEditRecord(const std::filesystem::path& path,
+                         const VersionEdit& persisted,
+                         const VersionEdit& edit,
+                         std::ios::openmode mode) {
+  const std::string payload = BuildEditPayload(persisted, edit);
+  std::ostringstream header;
+  header << "record " << payload.size() << ' ' << CRC32(payload) << '\n';
+
+  {
+    std::ofstream out(path, std::ios::binary | mode);
+    if (!out.is_open()) {
+      return Status::IOError("failed to open MANIFEST for write: " + path.string());
+    }
+    out << header.str();
+    out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    out.flush();
+    if (!out) {
+      return Status::IOError("failed to write MANIFEST edit");
+    }
+  }
+  return FsyncFile(path);
+}
+
+Status TruncateTornManifest(const std::filesystem::path& path,
+                            std::uintmax_t size) {
+  std::error_code ec;
+  std::filesystem::resize_file(path, size, ec);
+  if (ec) {
+    return Status::IOError("failed to truncate torn MANIFEST: " + ec.message());
+  }
+  Status status = FsyncFile(path);
+  if (!status.ok()) {
+    return status;
+  }
+  return FsyncDirectory(path.parent_path());
+}
+
 Status ParseEditPayload(const std::filesystem::path& db_path,
                         const std::string& payload,
                         VersionEdit* edit) {
@@ -301,13 +338,20 @@ Status Manifest::LoadEditLog() {
 
   VersionEdit replayed;
   bool saw_record = false;
+  bool torn_tail = false;
+  std::uintmax_t last_good_offset = 0;
   while (true) {
+    const std::uintmax_t record_offset = last_good_offset;
     std::string header;
     if (!std::getline(in, header)) {
       if (in.eof()) {
         break;
       }
       return Status::IOError("failed to read MANIFEST edit header");
+    }
+    if (in.eof()) {
+      torn_tail = true;
+      break;
     }
     if (header.empty()) {
       return Status::Corruption("empty MANIFEST edit header");
@@ -329,6 +373,10 @@ Status Manifest::LoadEditLog() {
     std::string payload(payload_size, '\0');
     in.read(payload.data(), static_cast<std::streamsize>(payload.size()));
     if (in.gcount() != static_cast<std::streamsize>(payload.size())) {
+      if (!in.eof()) {
+        return Status::IOError("failed to read MANIFEST edit payload");
+      }
+      torn_tail = true;
       break;
     }
     if (CRC32(payload) != expected_checksum) {
@@ -340,10 +388,18 @@ Status Manifest::LoadEditLog() {
       return status;
     }
     saw_record = true;
+    last_good_offset = record_offset + header.size() + 1 + payload.size();
   }
 
   if (!saw_record) {
     return Status::Corruption("MANIFEST edit log is empty");
+  }
+  if (torn_tail) {
+    in.close();
+    Status status = TruncateTornManifest(manifest_path_, last_good_offset);
+    if (!status.ok()) {
+      return status;
+    }
   }
   for (const auto& file : replayed.sstables) {
     if (!std::filesystem::exists(file.file_path)) {
@@ -389,53 +445,50 @@ Status Manifest::WriteCurrentFile() {
 
 Status Manifest::Save(const VersionEdit& edit) {
   std::filesystem::create_directories(db_path_);
-  if (!std::filesystem::exists(CurrentPath(db_path_)) || legacy_format_loaded_) {
-    const std::ios::openmode mode =
-        legacy_format_loaded_ ? std::ios::trunc : std::ios::app;
-    std::ofstream initialize(manifest_path_, mode);
-    if (!initialize.is_open()) {
-      return Status::IOError("failed to initialize MANIFEST: " + manifest_path_.string());
+  const bool current_exists = std::filesystem::exists(CurrentPath(db_path_));
+
+  if (legacy_format_loaded_) {
+    const std::filesystem::path tmp_path = manifest_path_.string() + ".tmp";
+    Status status = PersistEditRecord(tmp_path, VersionEdit{}, edit, std::ios::trunc);
+    if (!status.ok()) {
+      std::filesystem::remove(tmp_path);
+      return status;
     }
-    initialize.close();
-    if (legacy_format_loaded_) {
-      persisted_edit_ = VersionEdit{};
-      legacy_format_loaded_ = false;
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, manifest_path_, ec);
+    if (ec) {
+      std::filesystem::remove(tmp_path);
+      return Status::IOError("failed to replace legacy MANIFEST: " + ec.message());
     }
-    Status status = WriteCurrentFile();
+    status = FsyncDirectory(db_path_);
     if (!status.ok()) {
       return status;
     }
-  }
-
-  const std::string payload = BuildEditPayload(persisted_edit_, edit);
-  std::ostringstream header;
-  header << "record " << payload.size() << ' ' << CRC32(payload) << '\n';
-
-  {
-    std::ofstream out(manifest_path_, std::ios::binary | std::ios::app);
-    if (!out.is_open()) {
-      return Status::IOError("failed to open MANIFEST for append: " +
-                             manifest_path_.string());
+    status = WriteCurrentFile();
+    if (!status.ok()) {
+      return status;
     }
-    out << header.str();
-    out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
-    out.flush();
-    if (!out) {
-      return Status::IOError("failed to append MANIFEST edit");
+  } else {
+    Status status =
+        PersistEditRecord(manifest_path_, persisted_edit_, edit, std::ios::app);
+    if (!status.ok()) {
+      return status;
     }
-  }
-
-  Status status = FsyncFile(manifest_path_);
-  if (!status.ok()) {
-    return status;
-  }
-  status = FsyncDirectory(db_path_);
-  if (!status.ok()) {
-    return status;
+    status = FsyncDirectory(db_path_);
+    if (!status.ok()) {
+      return status;
+    }
+    if (!current_exists) {
+      status = WriteCurrentFile();
+      if (!status.ok()) {
+        return status;
+      }
+    }
   }
 
   edit_ = edit;
   persisted_edit_ = edit;
+  legacy_format_loaded_ = false;
   return Status::OK();
 }
 

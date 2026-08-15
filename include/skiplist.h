@@ -31,9 +31,10 @@ class SkipList {
   std::optional<Entry> Get(const std::string& key, SequenceNumber read_sequence) const;
   std::vector<VersionedEntry> Entries() const;
   size_t Size() const;
-  void Clear();
 
  private:
+  void Clear();
+
   struct Node {
     std::string internal_key;
     Entry entry;
@@ -49,6 +50,10 @@ class SkipList {
   static constexpr double kBranching = 0.5;
 
   int RandomLevel();
+  void Insert(std::string key,
+              SequenceNumber sequence,
+              std::string value,
+              bool deleted);
   Node* FindGreaterOrEqual(const std::string& internal_key,
                            std::vector<Node*>* prev) const;
 

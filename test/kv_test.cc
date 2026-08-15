@@ -1,11 +1,13 @@
-#include <cassert>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <fstream>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -17,6 +19,18 @@
 namespace {
 
 constexpr size_t kFlushLimit = 1024;
+
+[[noreturn]] void CheckFailed(const char* expression, const char* file, int line) {
+  std::cerr << file << ':' << line << ": CHECK failed: " << expression << '\n';
+  std::abort();
+}
+
+#define CHECK(expression)                     \
+  do {                                        \
+    if (!(expression)) {                      \
+      CheckFailed(#expression, __FILE__, __LINE__); \
+    }                                         \
+  } while (false)
 
 #ifndef KV_TEST_DB_ROOT
 #define KV_TEST_DB_ROOT "test/test_dbs"
@@ -90,7 +104,7 @@ size_t CountWALFiles(const std::filesystem::path& db_path) {
 
 std::filesystem::path FirstSSTablePath(const std::filesystem::path& db_path) {
   auto files = ListSSTables(db_path);
-  assert(!files.empty());
+  CHECK(!files.empty());
   return files.front();
 }
 
@@ -133,8 +147,8 @@ void TestBasicWALRecovery() {
 
     std::string value;
     MustOK(db.Get("k1", &value));
-    assert(value == "v1");
-    assert(db.Get("k2", &value).IsNotFound());
+    CHECK(value == "v1");
+    CHECK(db.Get("k2", &value).IsNotFound());
   }
 
   {
@@ -143,8 +157,8 @@ void TestBasicWALRecovery() {
 
     std::string value;
     MustOK(db.Get("k1", &value));
-    assert(value == "v1");
-    assert(db.Get("k2", &value).IsNotFound());
+    CHECK(value == "v1");
+    CHECK(db.Get("k2", &value).IsNotFound());
   }
 
   std::filesystem::remove_all(db_path);
@@ -159,15 +173,15 @@ void TestFlushAndSSTableRecovery() {
     MustOK(db.Open());
     FillToFlush(&db, "a", "v");
 
-    assert(WaitForSSTableCount(&db, 1));
-    assert(ListSSTables(db_path).size() == 1);
-    assert(CountWALFiles(db_path) == 1);
+    CHECK(WaitForSSTableCount(&db, 1));
+    CHECK(ListSSTables(db_path).size() == 1);
+    CHECK(CountWALFiles(db_path) == 1);
 
     std::string value;
     MustOK(db.Get("a" + Key(0), &value));
-    assert(value == "v0");
+    CHECK(value == "v0");
     MustOK(db.Get("a" + Key(1023), &value));
-    assert(value == "v1023");
+    CHECK(value == "v1023");
 
     MustOK(db.Put("wal_only", "still_in_wal"));
   }
@@ -178,9 +192,9 @@ void TestFlushAndSSTableRecovery() {
 
     std::string value;
     MustOK(db.Get("a" + Key(100), &value));
-    assert(value == "v100");
+    CHECK(value == "v100");
     MustOK(db.Get("wal_only", &value));
-    assert(value == "still_in_wal");
+    CHECK(value == "still_in_wal");
   }
 
   std::filesystem::remove_all(db_path);
@@ -195,16 +209,16 @@ void TestNewestSSTableWins() {
     MustOK(db.Open());
     MustOK(db.Put("shared", "old"));
     FillToFlush(&db, "old", "v");
-    assert(WaitForSSTableCount(&db, 1));
+    CHECK(WaitForSSTableCount(&db, 1));
     MustOK(db.Put("shared", "new"));
     FillToFlush(&db, "new", "v");
-    assert(WaitForSSTableCount(&db, 2));
+    CHECK(WaitForSSTableCount(&db, 2));
 
-    assert(ListSSTables(db_path).size() == 2);
+    CHECK(ListSSTables(db_path).size() == 2);
 
     std::string value;
     MustOK(db.Get("shared", &value));
-    assert(value == "new");
+    CHECK(value == "new");
   }
 
   {
@@ -213,7 +227,7 @@ void TestNewestSSTableWins() {
 
     std::string value;
     MustOK(db.Get("shared", &value));
-    assert(value == "new");
+    CHECK(value == "new");
   }
 
   std::filesystem::remove_all(db_path);
@@ -232,7 +246,7 @@ void TestDeleteFlushRecovery() {
     FillToFlush(&db, "second", "v");
 
     std::string value;
-    assert(db.Get("gone", &value).IsNotFound());
+    CHECK(db.Get("gone", &value).IsNotFound());
   }
 
   {
@@ -240,25 +254,37 @@ void TestDeleteFlushRecovery() {
     MustOK(db.Open());
 
     std::string value;
-    assert(db.Get("gone", &value).IsNotFound());
+    CHECK(db.Get("gone", &value).IsNotFound());
   }
 
   std::filesystem::remove_all(db_path);
 }
 
-void TestInvalidInput() {
+void TestInputValidationAndBinaryValues() {
   const std::filesystem::path db_path = TestDBPath("test_db_invalid");
   std::filesystem::remove_all(db_path);
 
   kv::DB db(db_path);
   MustOK(db.Open());
 
-  assert(!db.Put("bad\tkey", "value").ok());
-  assert(!db.Put("bad\nkey", "value").ok());
-  assert(!db.Delete("bad\tkey").ok());
-  assert(!db.Put("key", "bad\tvalue").ok());
-  assert(!db.Put("key", "bad\nvalue").ok());
-  assert(!db.Put("key", "__DELETE__").ok());
+  CHECK(!db.Put("bad\tkey", "value").ok());
+  CHECK(!db.Put("bad\nkey", "value").ok());
+  CHECK(!db.Delete("bad\tkey").ok());
+  std::string binary_value = "tab\tnewline\nnul";
+  binary_value.push_back('\0');
+  binary_value += "__DELETE__";
+  MustOK(db.Put("key", binary_value));
+  std::string value;
+  MustOK(db.Get("key", &value));
+  CHECK(value == binary_value);
+  MustOK(db.Close());
+
+  {
+    kv::DB reopened(db_path);
+    MustOK(reopened.Open());
+    MustOK(reopened.Get("key", &value));
+    CHECK(value == binary_value);
+  }
 
   std::filesystem::remove_all(db_path);
 }
@@ -277,13 +303,14 @@ void TestUpdateDeleteAndValues() {
 
   std::string value;
   MustOK(db.Get("k", &value));
-  assert(value == "v2");
-  assert(db.Get("missing", &value).IsNotFound());
+  CHECK(value == "v2");
+  CHECK(db.Get("missing", &value).IsNotFound());
   MustOK(db.Get("empty", &value));
-  assert(value.empty());
+  CHECK(value.empty());
   MustOK(db.Get("large", &value));
-  assert(value.size() == 4096);
+  CHECK(value.size() == 4096);
 
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -293,15 +320,15 @@ void TestWriteBatchOperationsAndRecovery() {
 
   {
     kv::WriteBatch batch;
-    assert(batch.Count() == 0);
+    CHECK(batch.Count() == 0);
     batch.Put("a", "v1");
     batch.Put("b", "v2");
     batch.Delete("missing");
-    assert(batch.Count() == 3);
+    CHECK(batch.Count() == 3);
 
     kv::WriteBatch decoded;
     MustOK(decoded.Decode(batch.Encode()));
-    assert(decoded.Count() == 3);
+    CHECK(decoded.Count() == 3);
 
     kv::DB db(db_path);
     MustOK(db.Open());
@@ -314,12 +341,12 @@ void TestWriteBatchOperationsAndRecovery() {
 
     std::string value;
     MustOK(db.Get("a", &value));
-    assert(value == "v3");
-    assert(db.Get("b", &value).IsNotFound());
-    assert(db.Get("missing", &value).IsNotFound());
+    CHECK(value == "v3");
+    CHECK(db.Get("b", &value).IsNotFound());
+    CHECK(db.Get("missing", &value).IsNotFound());
 
     overwrite.Clear();
-    assert(overwrite.Count() == 0);
+    CHECK(overwrite.Count() == 0);
   }
 
   {
@@ -328,9 +355,9 @@ void TestWriteBatchOperationsAndRecovery() {
 
     std::string value;
     MustOK(db.Get("a", &value));
-    assert(value == "v3");
-    assert(db.Get("b", &value).IsNotFound());
-    assert(db.Get("missing", &value).IsNotFound());
+    CHECK(value == "v3");
+    CHECK(db.Get("b", &value).IsNotFound());
+    CHECK(db.Get("missing", &value).IsNotFound());
   }
 
   std::filesystem::remove_all(db_path);
@@ -366,8 +393,8 @@ void TestTruncatedLastWALBatchIsIgnored() {
 
     std::string value;
     MustOK(db.Get("durable", &value));
-    assert(value == "yes");
-    assert(db.Get("partial_a", &value).IsNotFound());
+    CHECK(value == "yes");
+    CHECK(db.Get("partial_a", &value).IsNotFound());
   }
 
   std::filesystem::remove_all(db_path);
@@ -393,13 +420,13 @@ void TestImmutableMemTableWriteAndReadOrdering() {
 
     std::string value;
     MustOK(db.Get("shared", &value));
-    assert(value == "new");
+    CHECK(value == "new");
     MustOK(db.Get("filler1", &value));
-    assert(value == "v1");
+    CHECK(value == "v1");
     MustOK(db.Get("active", &value));
-    assert(value == "v3");
+    CHECK(value == "v3");
 
-    assert(WaitForSSTableCount(&db, 2));
+    CHECK(WaitForSSTableCount(&db, 2));
   }
 
   {
@@ -408,11 +435,11 @@ void TestImmutableMemTableWriteAndReadOrdering() {
 
     std::string value;
     MustOK(db.Get("shared", &value));
-    assert(value == "new");
+    CHECK(value == "new");
     MustOK(db.Get("filler1", &value));
-    assert(value == "v1");
+    CHECK(value == "v1");
     MustOK(db.Get("active", &value));
-    assert(value == "v3");
+    CHECK(value == "v3");
   }
 
   std::filesystem::remove_all(db_path);
@@ -434,7 +461,7 @@ void TestCloseFlushesActiveAndImmutableMemTables() {
       MustOK(db.Put("k" + std::to_string(i), "v" + std::to_string(i)));
     }
     MustOK(db.Close());
-    assert(db.Stats().sstable_count >= 3);
+    CHECK(db.Stats().sstable_count >= 3);
   }
 
   {
@@ -443,7 +470,7 @@ void TestCloseFlushesActiveAndImmutableMemTables() {
     for (int i = 0; i < 8; ++i) {
       std::string value;
       MustOK(db.Get("k" + std::to_string(i), &value));
-      assert(value == "v" + std::to_string(i));
+      CHECK(value == "v" + std::to_string(i));
     }
   }
 
@@ -471,8 +498,8 @@ void TestFlushFailureKeepsWALForRecovery() {
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    assert(CountWALFiles(db_path) >= 1);
-    assert(!db.Close().ok());
+    CHECK(CountWALFiles(db_path) >= 1);
+    CHECK(!db.Close().ok());
   }
 
   kv::Options recovery_options;
@@ -484,9 +511,9 @@ void TestFlushFailureKeepsWALForRecovery() {
     MustOK(db.Open());
     std::string value;
     MustOK(db.Get("survives_a", &value));
-    assert(value == "va");
+    CHECK(value == "va");
     MustOK(db.Get("survives_b", &value));
-    assert(value == "vb");
+    CHECK(value == "vb");
   }
 
   std::filesystem::remove_all(db_path);
@@ -501,30 +528,30 @@ void TestManifestRecoveryAndFallback() {
     MustOK(db.Open());
     FillToFlush(&db, "m", "v");
   }
-  assert(std::filesystem::exists(db_path / "MANIFEST"));
+  CHECK(std::filesystem::exists(db_path / "MANIFEST"));
 
   {
     kv::DB db(db_path);
     MustOK(db.Open());
     std::string value;
     MustOK(db.Get("m" + Key(1), &value));
-    assert(value == "v1");
+    CHECK(value == "v1");
   }
 
   std::filesystem::remove(db_path / "MANIFEST");
   {
     kv::DB db(db_path);
-    assert(db.Open().IsIOError());
+    CHECK(db.Open().IsIOError());
   }
 
   std::filesystem::remove(db_path / "CURRENT");
   {
     kv::DB db(db_path);
     MustOK(db.Open());
-    assert(std::filesystem::exists(db_path / "MANIFEST"));
+    CHECK(std::filesystem::exists(db_path / "MANIFEST"));
     std::string value;
     MustOK(db.Get("m" + Key(2), &value));
-    assert(value == "v2");
+    CHECK(value == "v2");
   }
 
   {
@@ -533,7 +560,7 @@ void TestManifestRecoveryAndFallback() {
   }
   {
     kv::DB db(db_path);
-    assert(db.Open().IsCorruption());
+    CHECK(db.Open().IsCorruption());
   }
 
   std::filesystem::remove_all(db_path);
@@ -550,8 +577,10 @@ void TestBadWALReturnsCorruption() {
     wal << "bad";
   }
 
-  kv::DB db(db_path);
-  assert(db.Open().IsCorruption());
+  {
+    kv::DB db(db_path);
+    CHECK(db.Open().IsCorruption());
+  }
   std::filesystem::remove_all(db_path);
 }
 
@@ -566,22 +595,22 @@ void TestManifestEditLogReplayAndTruncation() {
     kv::DB db(options);
     MustOK(db.Open());
     FillToFlush(&db, "e1", "v");
-    assert(WaitForSSTableCount(&db, 1));
+    CHECK(WaitForSSTableCount(&db, 1));
     FillToFlush(&db, "e2", "v");
-    assert(WaitForSSTableCount(&db, 2));
+    CHECK(WaitForSSTableCount(&db, 2));
     MustOK(db.Close());
   }
 
-  assert(std::filesystem::exists(db_path / "CURRENT"));
-  assert(CountManifestRecords(db_path) >= 3);
+  CHECK(std::filesystem::exists(db_path / "CURRENT"));
+  CHECK(CountManifestRecords(db_path) >= 3);
   {
     kv::DB db(db_path);
     MustOK(db.Open());
     std::string value;
     MustOK(db.Get("e1" + Key(10), &value));
-    assert(value == "v10");
+    CHECK(value == "v10");
     MustOK(db.Get("e2" + Key(10), &value));
-    assert(value == "v10");
+    CHECK(value == "v10");
   }
 
   const std::filesystem::path manifest_path = db_path / "MANIFEST";
@@ -592,7 +621,7 @@ void TestManifestEditLogReplayAndTruncation() {
     MustOK(db.Open());
     std::string value;
     MustOK(db.Get("e1" + Key(20), &value));
-    assert(value == "v20");
+    CHECK(value == "v20");
   }
 
   std::filesystem::remove_all(db_path);
@@ -606,21 +635,21 @@ void TestOrphanSSTableIgnoredOnOpen() {
     kv::DB db(db_path);
     MustOK(db.Open());
     FillToFlush(&db, "orphan", "v");
-    assert(WaitForSSTableCount(&db, 1));
+    CHECK(WaitForSSTableCount(&db, 1));
     MustOK(db.Close());
   }
 
   const auto files = ListSSTables(db_path);
-  assert(files.size() == 1);
+  CHECK(files.size() == 1);
   std::filesystem::copy_file(files.front(), db_path / "sst_999999.data");
 
   {
     kv::DB db(db_path);
     MustOK(db.Open());
-    assert(db.Stats().sstable_count == 1);
+    CHECK(db.Stats().sstable_count == 1);
     std::string value;
     MustOK(db.Get("orphan" + Key(1), &value));
-    assert(value == "v1");
+    CHECK(value == "v1");
   }
 
   std::filesystem::remove_all(db_path);
@@ -643,7 +672,7 @@ void TestManifestChecksumCorruption() {
   }
   {
     kv::DB db(db_path);
-    assert(db.Open().IsCorruption());
+    CHECK(db.Open().IsCorruption());
   }
 
   std::filesystem::remove_all(db_path);
@@ -658,7 +687,9 @@ void TestWALChecksumCorruption() {
   {
     kv::WALWriter wal(db_path / "wal_000001.log");
     MustOK(wal.Open());
-    MustOK(wal.AppendPut("crc_key", 1, "crc_value"));
+    kv::WriteBatch batch;
+    batch.Put("crc_key", "crc_value");
+    MustOK(wal.AppendBatch(batch, 1));
     wal.Close();
   }
   {
@@ -669,7 +700,7 @@ void TestWALChecksumCorruption() {
   }
   {
     kv::DB db(db_path);
-    assert(db.Open().IsCorruption());
+    CHECK(db.Open().IsCorruption());
   }
 
   std::filesystem::remove_all(db_path);
@@ -694,7 +725,7 @@ void TestBadSSTableMagicReturnsCorruption() {
 
   {
     kv::DB db(db_path);
-    assert(db.Open().IsCorruption());
+    CHECK(db.Open().IsCorruption());
   }
 
   std::filesystem::remove_all(db_path);
@@ -722,7 +753,7 @@ void TestSSTableBlockChecksumCorruption() {
     kv::DB db(db_path);
     MustOK(db.Open());
     std::string value;
-    assert(db.Get("crc" + Key(0), &value).IsCorruption());
+    CHECK(db.Get("crc" + Key(0), &value).IsCorruption());
   }
 
   std::filesystem::remove_all(db_path);
@@ -739,21 +770,22 @@ void TestBloomFilterAndBlockCacheStats() {
   kv::DB db(options);
   MustOK(db.Open());
   FillToFlush(&db, "bc", "v");
-  assert(WaitForSSTableCount(&db, 1));
+  CHECK(WaitForSSTableCount(&db, 1));
 
   std::string value;
-  assert(db.Get("definitely_missing", &value).IsNotFound());
+  CHECK(db.Get("definitely_missing", &value).IsNotFound());
   kv::DBStats stats = db.Stats();
-  assert(stats.bloom_filtered > 0);
+  CHECK(stats.bloom_filtered > 0);
 
   MustOK(db.Get("bc" + Key(10), &value));
   stats = db.Stats();
-  assert(stats.cache_misses > 0);
+  CHECK(stats.cache_misses > 0);
   MustOK(db.Get("bc" + Key(10), &value));
   stats = db.Stats();
-  assert(stats.cache_hits > 0);
-  assert(stats.block_reads > 0);
+  CHECK(stats.cache_hits > 0);
+  CHECK(stats.block_reads > 0);
 
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -768,7 +800,7 @@ void TestBlockSSTableMultipleBlocks() {
     kv::DB db(options);
     MustOK(db.Open());
     FillToFlush(&db, "blk", std::string(20, 'v'));
-    assert(WaitForSSTableCount(&db, 1));
+    CHECK(WaitForSSTableCount(&db, 1));
 
     std::string value;
     MustOK(db.Get("blk" + Key(0), &value));
@@ -808,27 +840,28 @@ void TestCompaction() {
   MustOK(db.Delete("deleted"));
   FillToFlush(&db, "c4", "v");
 
-  assert(WaitForSSTableCount(&db, 4));
+  CHECK(WaitForSSTableCount(&db, 4));
   const auto old_sstables = ListSSTables(db_path);
-  assert(old_sstables.size() >= 4);
+  CHECK(old_sstables.size() >= 4);
   MustOK(db.Compact());
-  assert(db.Stats().sstable_count == 1);
-  assert(db.Stats().compaction_count == 1);
+  CHECK(db.Stats().sstable_count == 1);
+  CHECK(db.Stats().compaction_count == 1);
   for (const auto& old_sstable : old_sstables) {
-    assert(!std::filesystem::exists(old_sstable));
+    CHECK(!std::filesystem::exists(old_sstable));
   }
 
   std::string value;
   MustOK(db.Get("shared", &value));
-  assert(value == "v2");
-  assert(db.Get("deleted", &value).IsNotFound());
+  CHECK(value == "v2");
+  CHECK(db.Get("deleted", &value).IsNotFound());
+  MustOK(db.Close());
 
   {
     kv::DB reopened(db_path);
     MustOK(reopened.Open());
     MustOK(reopened.Get("shared", &value));
-    assert(value == "v2");
-    assert(reopened.Get("deleted", &value).IsNotFound());
+    CHECK(value == "v2");
+    CHECK(reopened.Get("deleted", &value).IsNotFound());
   }
 
   std::filesystem::remove_all(db_path);
@@ -845,10 +878,11 @@ void TestAutomaticCompaction() {
   MustOK(db.Open());
   FillToFlush(&db, "a1", "v");
   FillToFlush(&db, "a2", "v");
-  assert(WaitForCompactionCount(&db, 1));
-  assert(db.Stats().sstable_count == 1);
-  assert(db.Stats().compaction_count == 1);
+  CHECK(WaitForCompactionCount(&db, 1));
+  CHECK(db.Stats().sstable_count == 1);
+  CHECK(db.Stats().compaction_count == 1);
 
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -863,19 +897,20 @@ void TestLeveledCompactionL0ToL1() {
   MustOK(db.Open());
   FillToFlush(&db, "l0a", "v");
   FillToFlush(&db, "l0b", "v");
-  assert(WaitForCompactionCount(&db, 1));
+  CHECK(WaitForCompactionCount(&db, 1));
 
   kv::DBStats stats = db.Stats();
-  assert(stats.level0_sstable_count == 0);
-  assert(stats.level1_sstable_count >= 1);
-  assert(stats.level2_sstable_count == 0);
+  CHECK(stats.level0_sstable_count == 0);
+  CHECK(stats.level1_sstable_count >= 1);
+  CHECK(stats.level2_sstable_count == 0);
 
   std::string value;
   MustOK(db.Get("l0a" + Key(20), &value));
-  assert(value == "v20");
+  CHECK(value == "v20");
   MustOK(db.Get("l0b" + Key(20), &value));
-  assert(value == "v20");
+  CHECK(value == "v20");
 
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -895,26 +930,27 @@ void TestLeveledCompactionL1ToL2AndTombstones() {
   MustOK(db.Put("shared", "v2"));
   MustOK(db.Delete("deleted"));
   FillToFlush(&db, "round2", "v");
-  assert(WaitForCompactionCount(&db, 1));
+  CHECK(WaitForCompactionCount(&db, 1));
 
   FillToFlush(&db, "round3", "v");
   FillToFlush(&db, "round4", "v");
-  assert(WaitForCompactionCount(&db, 2));
+  CHECK(WaitForCompactionCount(&db, 2));
 
   kv::DBStats stats = db.Stats();
-  assert(stats.level2_sstable_count >= 1);
+  CHECK(stats.level2_sstable_count >= 1);
 
   std::string value;
   MustOK(db.Get("shared", &value));
-  assert(value == "v2");
-  assert(db.Get("deleted", &value).IsNotFound());
+  CHECK(value == "v2");
+  CHECK(db.Get("deleted", &value).IsNotFound());
+  MustOK(db.Close());
 
   {
     kv::DB reopened(db_path);
     MustOK(reopened.Open());
     MustOK(reopened.Get("shared", &value));
-    assert(value == "v2");
-    assert(reopened.Get("deleted", &value).IsNotFound());
+    CHECK(value == "v2");
+    CHECK(reopened.Get("deleted", &value).IsNotFound());
   }
 
   std::filesystem::remove_all(db_path);
@@ -934,17 +970,18 @@ void TestCompactionUsesStreamingIterators() {
   FillToFlush(&db, "stream_a", "v");
   MustOK(db.Put("shared", "new"));
   FillToFlush(&db, "stream_b", "v");
-  assert(WaitForSSTableCount(&db, 2));
+  CHECK(WaitForSSTableCount(&db, 2));
 
   const auto before = db.Stats().sstable_full_scans;
   MustOK(db.Compact());
   const auto after = db.Stats().sstable_full_scans;
-  assert(after == before);
+  CHECK(after == before);
 
   std::string value;
   MustOK(db.Get("shared", &value));
-  assert(value == "new");
+  CHECK(value == "new");
 
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -963,10 +1000,11 @@ void TestSnapshotReadStability() {
   kv::ReadOptions snapshot_read;
   snapshot_read.snapshot = snapshot;
   MustOK(db.Get("k", &value, snapshot_read));
-  assert(value == "v1");
-  assert(db.Get("k", &value).IsNotFound());
+  CHECK(value == "v1");
+  CHECK(db.Get("k", &value).IsNotFound());
   db.ReleaseSnapshot(snapshot);
 
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -981,26 +1019,27 @@ void TestSnapshotAcrossFlushAndCompaction() {
   MustOK(db.Open());
   MustOK(db.Put("shared", "v1"));
   FillToFlush(&db, "snap_old", "v");
-  assert(WaitForSSTableCount(&db, 1));
+  CHECK(WaitForSSTableCount(&db, 1));
   const kv::Snapshot* snapshot = db.GetSnapshot();
   MustOK(db.Put("shared", "v2"));
   FillToFlush(&db, "snap_new", "v");
-  assert(WaitForSSTableCount(&db, 2));
+  CHECK(WaitForSSTableCount(&db, 2));
 
   MustOK(db.Compact());
   std::string value;
   kv::ReadOptions snapshot_read;
   snapshot_read.snapshot = snapshot;
   MustOK(db.Get("shared", &value, snapshot_read));
-  assert(value == "v1");
+  CHECK(value == "v1");
   MustOK(db.Get("shared", &value));
-  assert(value == "v2");
+  CHECK(value == "v2");
 
   db.ReleaseSnapshot(snapshot);
   MustOK(db.Compact());
   MustOK(db.Get("shared", &value));
-  assert(value == "v2");
+  CHECK(value == "v2");
 
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -1021,34 +1060,37 @@ void TestIteratorLatestAndSnapshotViews() {
   snapshot_read.snapshot = snapshot;
   auto snapshot_it = db.NewIterator(snapshot_read);
   snapshot_it->SeekToFirst();
-  assert(snapshot_it->Valid());
-  assert(snapshot_it->key() == "a");
-  assert(snapshot_it->value() == "old_a");
+  CHECK(snapshot_it->Valid());
+  CHECK(snapshot_it->key() == "a");
+  CHECK(snapshot_it->value() == "old_a");
   snapshot_it->Next();
-  assert(snapshot_it->Valid());
-  assert(snapshot_it->key() == "b");
-  assert(snapshot_it->value() == "old_b");
+  CHECK(snapshot_it->Valid());
+  CHECK(snapshot_it->key() == "b");
+  CHECK(snapshot_it->value() == "old_b");
   snapshot_it->Next();
-  assert(!snapshot_it->Valid());
+  CHECK(!snapshot_it->Valid());
   MustOK(snapshot_it->status());
 
   auto latest_it = db.NewIterator();
   latest_it->SeekToFirst();
-  assert(latest_it->Valid());
-  assert(latest_it->key() == "a");
-  assert(latest_it->value() == "new_a");
+  CHECK(latest_it->Valid());
+  CHECK(latest_it->key() == "a");
+  CHECK(latest_it->value() == "new_a");
   latest_it->Next();
-  assert(latest_it->Valid());
-  assert(latest_it->key() == "c");
-  assert(latest_it->value() == "new_c");
+  CHECK(latest_it->Valid());
+  CHECK(latest_it->key() == "c");
+  CHECK(latest_it->value() == "new_c");
   latest_it->Seek("b");
-  assert(latest_it->Valid());
-  assert(latest_it->key() == "c");
+  CHECK(latest_it->Valid());
+  CHECK(latest_it->key() == "c");
   latest_it->Next();
-  assert(!latest_it->Valid());
+  CHECK(!latest_it->Valid());
   MustOK(latest_it->status());
 
   db.ReleaseSnapshot(snapshot);
+  snapshot_it.reset();
+  latest_it.reset();
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -1063,19 +1105,212 @@ void TestIteratorDoesNotMaterializeSSTableBlocks() {
   kv::DB db(options);
   MustOK(db.Open());
   FillToFlush(&db, "lazy", std::string(20, 'v'));
-  assert(WaitForSSTableCount(&db, 1));
+  CHECK(WaitForSSTableCount(&db, 1));
 
   const auto before = db.Stats().block_reads;
   auto iterator = db.NewIterator();
   const auto after_create = db.Stats().block_reads;
-  assert(after_create == before);
+  CHECK(after_create == before);
 
   iterator->Seek("lazy" + Key(900));
-  assert(iterator->Valid());
-  assert(iterator->key() == "lazy" + Key(900));
+  CHECK(iterator->Valid());
+  CHECK(iterator->key() == "lazy" + Key(900));
   const auto after_seek = db.Stats().block_reads;
-  assert(after_seek - before < 20);
+  CHECK(after_seek - before < 20);
 
+  iterator.reset();
+  MustOK(db.Close());
+  std::filesystem::remove_all(db_path);
+}
+
+void TestIteratorPinsCompactedSSTables() {
+  const std::filesystem::path db_path = TestDBPath("test_db_iterator_compaction_pin");
+  std::filesystem::remove_all(db_path);
+
+  kv::Options options;
+  options.db_path = db_path;
+  options.level0_sstable_limit = 100;
+  options.block_cache_capacity = 0;
+  kv::DB db(options);
+  MustOK(db.Open());
+
+  MustOK(db.Put("lifetime_target", "old_value"));
+  for (size_t i = 0; i + 1 < kFlushLimit; ++i) {
+    MustOK(db.Put("iterator_pin_" + Key(i), "v" + std::to_string(i)));
+  }
+  CHECK(WaitForSSTableCount(&db, 1));
+
+  const auto old_sstables = ListSSTables(db_path);
+  CHECK(old_sstables.size() == 1);
+  auto iterator = db.NewIterator();
+  MustOK(db.Compact());
+  for (const auto& old_sstable : old_sstables) {
+    CHECK(!std::filesystem::exists(old_sstable));
+  }
+
+  iterator->Seek("lifetime_target");
+  CHECK(iterator->Valid());
+  CHECK(iterator->key() == "lifetime_target");
+  CHECK(iterator->value() == "old_value");
+  MustOK(iterator->status());
+
+  iterator.reset();
+  MustOK(db.Close());
+  std::filesystem::remove_all(db_path);
+}
+
+void TestGetPinsCompactedSSTableFile() {
+  const std::filesystem::path db_path = TestDBPath("test_db_get_compaction_pin");
+  std::filesystem::remove_all(db_path);
+
+  std::mutex barrier_mutex;
+  std::condition_variable barrier_cv;
+  bool read_version_pinned = false;
+  bool resume_read = false;
+
+  kv::Options options;
+  options.db_path = db_path;
+  options.level0_sstable_limit = 100;
+  options.block_cache_capacity = 0;
+  options.testing_after_read_version_pin = [&] {
+    std::unique_lock<std::mutex> lock(barrier_mutex);
+    read_version_pinned = true;
+    barrier_cv.notify_one();
+    barrier_cv.wait(lock, [&] { return resume_read; });
+  };
+
+  kv::DB db(options);
+  MustOK(db.Open());
+  MustOK(db.Put("pinned_get_target", "pinned_value"));
+  for (size_t i = 0; i + 1 < kFlushLimit; ++i) {
+    MustOK(db.Put("get_pin_" + Key(i), "v" + std::to_string(i)));
+  }
+  CHECK(WaitForSSTableCount(&db, 1));
+  const auto old_sstables = ListSSTables(db_path);
+  CHECK(old_sstables.size() == 1);
+
+  kv::Status read_status;
+  std::string read_value;
+  std::thread reader([&] { read_status = db.Get("pinned_get_target", &read_value); });
+  {
+    std::unique_lock<std::mutex> lock(barrier_mutex);
+    CHECK(barrier_cv.wait_for(lock, std::chrono::seconds(2),
+                              [&] { return read_version_pinned; }));
+  }
+
+  MustOK(db.Compact());
+  for (const auto& old_sstable : old_sstables) {
+    CHECK(!std::filesystem::exists(old_sstable));
+  }
+  {
+    std::lock_guard<std::mutex> lock(barrier_mutex);
+    resume_read = true;
+  }
+  barrier_cv.notify_one();
+  reader.join();
+
+  MustOK(read_status);
+  CHECK(read_value == "pinned_value");
+  MustOK(db.Close());
+  std::filesystem::remove_all(db_path);
+}
+
+void TestConcurrentSSTableReadsAndStats() {
+  const std::filesystem::path db_path = TestDBPath("test_db_concurrent_sstable_stats");
+  std::filesystem::remove_all(db_path);
+
+  kv::Options options;
+  options.db_path = db_path;
+  options.block_size = 128;
+  options.block_cache_capacity = 8;
+  options.level0_sstable_limit = 100;
+  kv::DB db(options);
+  MustOK(db.Open());
+  FillToFlush(&db, "stats", "v");
+  CHECK(WaitForSSTableCount(&db, 1));
+
+  constexpr int kReaderCount = 4;
+  constexpr int kReadsPerThread = 500;
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::atomic<bool> failed{false};
+  std::vector<std::thread> readers;
+  for (int thread_index = 0; thread_index < kReaderCount; ++thread_index) {
+    readers.emplace_back([&, thread_index] {
+      ready.fetch_add(1);
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+      for (int i = 0; i < kReadsPerThread; ++i) {
+        const size_t key_index =
+            static_cast<size_t>((thread_index * 131 + i * 17) % kFlushLimit);
+        std::string value;
+        const kv::Status status = db.Get("stats" + Key(key_index), &value);
+        if (!status.ok() || value != "v" + std::to_string(key_index) ||
+            db.Stats().sstable_count != 1) {
+          failed = true;
+          return;
+        }
+      }
+    });
+  }
+  while (ready.load() != kReaderCount) {
+    std::this_thread::yield();
+  }
+  start = true;
+  for (auto& reader : readers) {
+    reader.join();
+  }
+
+  CHECK(!failed.load());
+  const kv::DBStats stats = db.Stats();
+  CHECK(stats.cache_hits > 0);
+  CHECK(stats.cache_misses > 0);
+  CHECK(stats.block_reads > 0);
+  MustOK(db.Close());
+  std::filesystem::remove_all(db_path);
+}
+
+void TestRestartSeekAcrossKeyVersions() {
+  const std::filesystem::path db_path = TestDBPath("test_db_restart_versions");
+  std::filesystem::remove_all(db_path);
+
+  kv::Options options;
+  options.db_path = db_path;
+  options.memtable_entries_limit = 48;
+  options.block_size = 128;
+  options.block_cache_capacity = 0;
+  options.level0_sstable_limit = 100;
+
+  kv::DB db(options);
+  MustOK(db.Open());
+  const kv::Snapshot* version_16 = nullptr;
+  const kv::Snapshot* version_32 = nullptr;
+  for (int version = 1; version <= 48; ++version) {
+    MustOK(db.Put("versioned", "v" + std::to_string(version)));
+    if (version == 16) {
+      version_16 = db.GetSnapshot();
+    } else if (version == 32) {
+      version_32 = db.GetSnapshot();
+    }
+  }
+  CHECK(WaitForSSTableCount(&db, 1));
+
+  std::string value;
+  kv::ReadOptions read_options;
+  read_options.snapshot = version_16;
+  MustOK(db.Get("versioned", &value, read_options));
+  CHECK(value == "v16");
+  read_options.snapshot = version_32;
+  MustOK(db.Get("versioned", &value, read_options));
+  CHECK(value == "v32");
+  MustOK(db.Get("versioned", &value));
+  CHECK(value == "v48");
+  CHECK(db.Stats().block_restart_seeks >= 3);
+
+  db.ReleaseSnapshot(version_16);
+  db.ReleaseSnapshot(version_32);
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -1093,23 +1328,23 @@ void TestPrefixCompressedSSTableBlocks() {
     for (size_t i = 0; i < kFlushLimit; ++i) {
       MustOK(db.Put("prefix_compressed_key_" + Key(i), "v" + std::to_string(i)));
     }
-    assert(WaitForSSTableCount(&db, 1));
+    CHECK(WaitForSSTableCount(&db, 1));
 
     const auto files = ListSSTables(db_path);
-    assert(files.size() == 1);
-    assert(std::filesystem::file_size(files.front()) < 33000);
+    CHECK(files.size() == 1);
+    CHECK(std::filesystem::file_size(files.front()) < 33000);
 
     std::string value;
     const auto restart_seeks_before = db.Stats().block_restart_seeks;
     MustOK(db.Get("prefix_compressed_key_" + Key(700), &value));
-    assert(value == "v700");
-    assert(db.Stats().block_restart_seeks > restart_seeks_before);
+    CHECK(value == "v700");
+    CHECK(db.Stats().block_restart_seeks > restart_seeks_before);
 
     auto iterator = db.NewIterator();
     iterator->Seek("prefix_compressed_key_" + Key(900));
-    assert(iterator->Valid());
-    assert(iterator->key() == "prefix_compressed_key_" + Key(900));
-    assert(iterator->value() == "v900");
+    CHECK(iterator->Valid());
+    CHECK(iterator->key() == "prefix_compressed_key_" + Key(900));
+    CHECK(iterator->value() == "v900");
   }
 
   {
@@ -1117,7 +1352,7 @@ void TestPrefixCompressedSSTableBlocks() {
     MustOK(db.Open());
     std::string value;
     MustOK(db.Get("prefix_compressed_key_" + Key(512), &value));
-    assert(value == "v512");
+    CHECK(value == "v512");
   }
 
   std::filesystem::remove_all(db_path);
@@ -1154,7 +1389,7 @@ void TestConcurrentPutGetAndWriteBatch() {
   for (auto& thread : threads) {
     thread.join();
   }
-  assert(!failed);
+  CHECK(!failed);
   MustOK(db.Close());
 
   kv::DB reopened(options);
@@ -1163,12 +1398,13 @@ void TestConcurrentPutGetAndWriteBatch() {
     for (int i = 0; i < 100; ++i) {
       std::string value;
       MustOK(reopened.Get("thread" + std::to_string(t) + "_a_" + std::to_string(i), &value));
-      assert(value == "va" + std::to_string(i));
+      CHECK(value == "va" + std::to_string(i));
       MustOK(reopened.Get("thread" + std::to_string(t) + "_b_" + std::to_string(i), &value));
-      assert(value == "vb" + std::to_string(i));
+      CHECK(value == "vb" + std::to_string(i));
     }
   }
 
+  MustOK(reopened.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -1206,11 +1442,11 @@ void TestConcurrentGetDuringFlushAndCompaction() {
   MustOK(db.Compact());
   stop = true;
   reader.join();
-  assert(!failed);
+  CHECK(!failed);
 
   std::string value;
   MustOK(db.Get("stable", &value));
-  assert(value == "v0");
+  CHECK(value == "v0");
   MustOK(db.Close());
 
   std::filesystem::remove_all(db_path);
@@ -1250,9 +1486,10 @@ void TestCloseWhileWriterIsActive() {
   for (int i = 0; i < written; ++i) {
     std::string value;
     MustOK(reopened.Get("close_key_" + std::to_string(i), &value));
-    assert(value == "v" + std::to_string(i));
+    CHECK(value == "v" + std::to_string(i));
   }
 
+  MustOK(reopened.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -1276,9 +1513,9 @@ void TestSequenceRecoveryAfterReopen() {
     kv::ReadOptions snapshot_read;
     snapshot_read.snapshot = snapshot;
     MustOK(db.Get("k", &value, snapshot_read));
-    assert(value == "v1");
+    CHECK(value == "v1");
     MustOK(db.Get("k", &value));
-    assert(value == "v2");
+    CHECK(value == "v2");
     db.ReleaseSnapshot(snapshot);
   }
 
@@ -1292,7 +1529,7 @@ int main() {
   TestFlushAndSSTableRecovery();
   TestNewestSSTableWins();
   TestDeleteFlushRecovery();
-  TestInvalidInput();
+  TestInputValidationAndBinaryValues();
   TestUpdateDeleteAndValues();
   TestWriteBatchOperationsAndRecovery();
   TestTruncatedLastWALBatchIsIgnored();
@@ -1318,6 +1555,10 @@ int main() {
   TestSnapshotAcrossFlushAndCompaction();
   TestIteratorLatestAndSnapshotViews();
   TestIteratorDoesNotMaterializeSSTableBlocks();
+  TestIteratorPinsCompactedSSTables();
+  TestGetPinsCompactedSSTableFile();
+  TestConcurrentSSTableReadsAndStats();
+  TestRestartSeekAcrossKeyVersions();
   TestPrefixCompressedSSTableBlocks();
   TestConcurrentPutGetAndWriteBatch();
   TestConcurrentGetDuringFlushAndCompaction();

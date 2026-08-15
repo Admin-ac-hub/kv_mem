@@ -7,6 +7,7 @@ namespace kv {
 BlockCache::BlockCache(size_t capacity) : capacity_(capacity) {}
 
 bool BlockCache::Get(std::uint64_t file_number, std::uint64_t block_offset, std::string* block) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (capacity_ == 0) {
     ++stats_.misses;
     return false;
@@ -26,6 +27,7 @@ bool BlockCache::Get(std::uint64_t file_number, std::uint64_t block_offset, std:
 }
 
 void BlockCache::Put(std::uint64_t file_number, std::uint64_t block_offset, std::string block) {
+  std::lock_guard<std::mutex> lock(mutex_);
   if (capacity_ == 0) {
     return;
   }
@@ -47,6 +49,7 @@ void BlockCache::Put(std::uint64_t file_number, std::uint64_t block_offset, std:
 }
 
 BlockCacheStats BlockCache::Stats() const {
+  std::lock_guard<std::mutex> lock(mutex_);
   return stats_;
 }
 

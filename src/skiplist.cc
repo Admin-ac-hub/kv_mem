@@ -1,44 +1,10 @@
 #include "skiplist.h"
 
-#include <limits>
 #include <utility>
 
+#include "format.h"
+
 namespace kv {
-
-namespace {
-
-constexpr char kInternalKeySeparator = '\0';
-
-std::string EncodeInternalKey(const std::string& user_key, SequenceNumber sequence) {
-  const SequenceNumber inverted = std::numeric_limits<SequenceNumber>::max() - sequence;
-  std::string out = user_key;
-  out.push_back(kInternalKeySeparator);
-  for (int i = 7; i >= 0; --i) {
-    out.push_back(static_cast<char>((inverted >> (i * 8)) & 0xff));
-  }
-  return out;
-}
-
-bool DecodeInternalKey(const std::string& internal_key,
-                       std::string* user_key,
-                       SequenceNumber* sequence) {
-  const size_t trailer_size = 1 + sizeof(SequenceNumber);
-  if (internal_key.size() < trailer_size ||
-      internal_key[internal_key.size() - trailer_size] != kInternalKeySeparator) {
-    return false;
-  }
-  *user_key = internal_key.substr(0, internal_key.size() - trailer_size);
-  SequenceNumber inverted = 0;
-  const char* ptr = internal_key.data() + internal_key.size() - sizeof(SequenceNumber);
-  for (int i = 0; i < 8; ++i) {
-    inverted = (inverted << 8) |
-               static_cast<SequenceNumber>(static_cast<unsigned char>(ptr[i]));
-  }
-  *sequence = std::numeric_limits<SequenceNumber>::max() - inverted;
-  return true;
-}
-
-}  // namespace
 
 SkipList::SkipList()
     : head_("", Entry{}, kMaxLevel),
@@ -88,13 +54,24 @@ SkipList::Node* SkipList::FindGreaterOrEqual(const std::string& internal_key,
 }
 
 void SkipList::Put(std::string key, SequenceNumber sequence, std::string value) {
+  Insert(std::move(key), sequence, std::move(value), false);
+}
+
+void SkipList::Delete(std::string key, SequenceNumber sequence) {
+  Insert(std::move(key), sequence, "", true);
+}
+
+void SkipList::Insert(std::string key,
+                      SequenceNumber sequence,
+                      std::string value,
+                      bool deleted) {
   std::string internal_key = EncodeInternalKey(key, sequence);
   std::vector<Node*> prev(static_cast<size_t>(kMaxLevel), nullptr);
   Node* candidate = FindGreaterOrEqual(internal_key, &prev);
   if (candidate != nullptr && candidate->internal_key == internal_key) {
     candidate->entry.value = std::move(value);
     candidate->entry.sequence = sequence;
-    candidate->entry.deleted = false;
+    candidate->entry.deleted = deleted;
     return;
   }
 
@@ -106,34 +83,8 @@ void SkipList::Put(std::string key, SequenceNumber sequence, std::string value) 
     level_ = new_level;
   }
 
-  Node* node = new Node(std::move(internal_key), Entry{sequence, std::move(value), false}, new_level);
-  for (int i = 0; i < new_level; ++i) {
-    node->next[static_cast<size_t>(i)] = prev[static_cast<size_t>(i)]->next[static_cast<size_t>(i)];
-    prev[static_cast<size_t>(i)]->next[static_cast<size_t>(i)] = node;
-  }
-  ++size_;
-}
-
-void SkipList::Delete(std::string key, SequenceNumber sequence) {
-  std::string internal_key = EncodeInternalKey(key, sequence);
-  std::vector<Node*> prev(static_cast<size_t>(kMaxLevel), nullptr);
-  Node* candidate = FindGreaterOrEqual(internal_key, &prev);
-  if (candidate != nullptr && candidate->internal_key == internal_key) {
-    candidate->entry.value.clear();
-    candidate->entry.sequence = sequence;
-    candidate->entry.deleted = true;
-    return;
-  }
-
-  int new_level = RandomLevel();
-  if (new_level > level_) {
-    for (int i = level_; i < new_level; ++i) {
-      prev[static_cast<size_t>(i)] = &head_;
-    }
-    level_ = new_level;
-  }
-
-  Node* node = new Node(std::move(internal_key), Entry{sequence, "", true}, new_level);
+  Node* node =
+      new Node(std::move(internal_key), Entry{sequence, std::move(value), deleted}, new_level);
   for (int i = 0; i < new_level; ++i) {
     node->next[static_cast<size_t>(i)] = prev[static_cast<size_t>(i)]->next[static_cast<size_t>(i)];
     prev[static_cast<size_t>(i)]->next[static_cast<size_t>(i)] = node;

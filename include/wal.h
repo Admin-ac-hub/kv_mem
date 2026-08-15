@@ -30,11 +30,7 @@ class WALWriter {
 
   Status Open();
   void Close();
-  Status Reset();
   Status AppendBatch(const WriteBatch& batch, SequenceNumber sequence);
-  Status AppendPut(const std::string& key, SequenceNumber sequence, const std::string& value);
-  Status AppendDelete(const std::string& key, SequenceNumber sequence);
-  const std::filesystem::path& Path() const;
 
  private:
   std::filesystem::path path_;
@@ -49,7 +45,10 @@ class WALReader {
 
  private:
   Status ReadLegacyRecord(std::uint32_t expected_checksum, WALBatchRecord* record);
-  Status ReadBatchRecord(WALBatchRecord* record, bool* eof);
+  Status ReadBatchRecord(std::uintmax_t record_offset,
+                         WALBatchRecord* record,
+                         bool* eof);
+  Status TruncateTornTail(std::uintmax_t record_offset, bool* eof);
 
   bool opened_ = false;
   std::filesystem::path path_;

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string_view>
 
@@ -71,6 +72,36 @@ std::uint64_t DecodeFixed64(const char* in) {
     value |= static_cast<std::uint64_t>(static_cast<unsigned char>(in[i])) << (8 * i);
   }
   return value;
+}
+
+std::string EncodeInternalKey(std::string_view user_key, SequenceNumber sequence) {
+  const SequenceNumber inverted = std::numeric_limits<SequenceNumber>::max() - sequence;
+  std::string encoded(user_key);
+  encoded.push_back('\0');
+  for (int i = 7; i >= 0; --i) {
+    encoded.push_back(static_cast<char>((inverted >> (i * 8)) & 0xff));
+  }
+  return encoded;
+}
+
+bool DecodeInternalKey(std::string_view internal_key,
+                       std::string* user_key,
+                       SequenceNumber* sequence) {
+  constexpr size_t kTrailerSize = 1 + sizeof(SequenceNumber);
+  if (internal_key.size() < kTrailerSize ||
+      internal_key[internal_key.size() - kTrailerSize] != '\0') {
+    return false;
+  }
+
+  user_key->assign(internal_key.data(), internal_key.size() - kTrailerSize);
+  SequenceNumber inverted = 0;
+  const char* ptr = internal_key.data() + internal_key.size() - sizeof(SequenceNumber);
+  for (int i = 0; i < 8; ++i) {
+    inverted = (inverted << 8) |
+               static_cast<SequenceNumber>(static_cast<unsigned char>(ptr[i]));
+  }
+  *sequence = std::numeric_limits<SequenceNumber>::max() - inverted;
+  return true;
 }
 
 std::uint32_t CRC32(std::string_view data) {

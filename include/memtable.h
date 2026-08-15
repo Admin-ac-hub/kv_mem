@@ -17,7 +17,6 @@ class MemTable {
                                      SequenceNumber read_sequence) const;
   std::vector<VersionedEntry> Entries() const;
   size_t Size() const;
-  void Clear();
 
  private:
   SkipList table_;

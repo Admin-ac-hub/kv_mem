@@ -61,16 +61,6 @@ void WALWriter::Close() {
   }
 }
 
-Status WALWriter::Reset() {
-  Close();
-  stream_.open(path_, std::ios::binary | std::ios::trunc);
-  if (!stream_.is_open()) {
-    return Status::IOError("failed to reset WAL: " + path_.string());
-  }
-  stream_.close();
-  return Open();
-}
-
 Status WALWriter::AppendBatch(const WriteBatch& batch, SequenceNumber sequence) {
   if (batch.Count() == 0) {
     return Status::OK();
@@ -115,24 +105,6 @@ Status WALWriter::AppendBatch(const WriteBatch& batch, SequenceNumber sequence) 
   return FsyncFile(path_);
 }
 
-Status WALWriter::AppendPut(const std::string& key,
-                            SequenceNumber sequence,
-                            const std::string& value) {
-  WriteBatch batch;
-  batch.Put(key, value);
-  return AppendBatch(batch, sequence);
-}
-
-Status WALWriter::AppendDelete(const std::string& key, SequenceNumber sequence) {
-  WriteBatch batch;
-  batch.Delete(key);
-  return AppendBatch(batch, sequence);
-}
-
-const std::filesystem::path& WALWriter::Path() const {
-  return path_;
-}
-
 WALReader::WALReader(std::filesystem::path path) : path_(std::move(path)) {}
 
 Status WALReader::ReadNext(WALBatchRecord* record, bool* eof) {
@@ -152,6 +124,11 @@ Status WALReader::ReadNext(WALBatchRecord* record, bool* eof) {
     opened_ = true;
   }
 
+  const std::streampos position = stream_.tellg();
+  if (position == std::streampos(-1)) {
+    return Status::IOError("failed to determine WAL record offset");
+  }
+  const auto record_offset = static_cast<std::uintmax_t>(position);
   std::array<char, 4> first_word{};
   stream_.read(first_word.data(), static_cast<std::streamsize>(first_word.size()));
   if (stream_.gcount() == 0) {
@@ -159,14 +136,17 @@ Status WALReader::ReadNext(WALBatchRecord* record, bool* eof) {
     return Status::OK();
   }
   if (stream_.gcount() != static_cast<std::streamsize>(first_word.size())) {
-    return Status::Corruption("incomplete WAL record prefix");
+    if (!stream_.eof()) {
+      return Status::IOError("failed to read WAL record prefix");
+    }
+    return TruncateTornTail(record_offset, eof);
   }
 
   const std::uint32_t word = DecodeFixed32(first_word.data());
   if (word != kWALBatchMagic) {
     return ReadLegacyRecord(word, record);
   }
-  return ReadBatchRecord(record, eof);
+  return ReadBatchRecord(record_offset, record, eof);
 }
 
 Status WALReader::ReadLegacyRecord(std::uint32_t expected_checksum,
@@ -215,12 +195,16 @@ Status WALReader::ReadLegacyRecord(std::uint32_t expected_checksum,
   return Status::OK();
 }
 
-Status WALReader::ReadBatchRecord(WALBatchRecord* record, bool* eof) {
+Status WALReader::ReadBatchRecord(std::uintmax_t record_offset,
+                                  WALBatchRecord* record,
+                                  bool* eof) {
   std::array<char, kBatchHeaderWithoutMagicSize> header{};
   stream_.read(header.data(), static_cast<std::streamsize>(header.size()));
   if (stream_.gcount() != static_cast<std::streamsize>(header.size())) {
-    *eof = true;
-    return Status::OK();
+    if (!stream_.eof()) {
+      return Status::IOError("failed to read WAL batch header");
+    }
+    return TruncateTornTail(record_offset, eof);
   }
 
   const auto record_type = static_cast<RecordType>(static_cast<std::uint8_t>(header[0]));
@@ -238,8 +222,10 @@ Status WALReader::ReadBatchRecord(WALBatchRecord* record, bool* eof) {
   if (payload_size > 0) {
     stream_.read(payload.data(), static_cast<std::streamsize>(payload.size()));
     if (stream_.gcount() != static_cast<std::streamsize>(payload.size())) {
-      *eof = true;
-      return Status::OK();
+      if (!stream_.eof()) {
+        return Status::IOError("failed to read WAL batch payload");
+      }
+      return TruncateTornTail(record_offset, eof);
     }
   }
 
@@ -260,6 +246,27 @@ Status WALReader::ReadBatchRecord(WALBatchRecord* record, bool* eof) {
 
   record->sequence = sequence;
   record->batch = std::move(batch);
+  return Status::OK();
+}
+
+Status WALReader::TruncateTornTail(std::uintmax_t record_offset, bool* eof) {
+  stream_.close();
+  opened_ = false;
+
+  std::error_code ec;
+  std::filesystem::resize_file(path_, record_offset, ec);
+  if (ec) {
+    return Status::IOError("failed to truncate torn WAL: " + ec.message());
+  }
+  Status status = FsyncFile(path_);
+  if (!status.ok()) {
+    return status;
+  }
+  status = FsyncDirectory(path_.parent_path());
+  if (!status.ok()) {
+    return status;
+  }
+  *eof = true;
   return Status::OK();
 }
 

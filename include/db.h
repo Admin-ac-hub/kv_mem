@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -35,6 +36,7 @@ struct Options {
   bool error_if_exists = false;
   bool testing_fail_flush = false;
   bool enable_event_log = false;
+  std::function<void()> testing_after_read_version_pin = {};
 };
 
 struct DBStats {
@@ -117,9 +119,9 @@ class DB {
   void BackgroundWorkerLoop();
   Status FlushImmutableMemTable(const ImmutableMemTable& immutable,
                                 std::uint64_t sstable_number,
-                                std::shared_ptr<SSTable>* table);
-  SSTableMeta BuildSSTableMeta(const std::shared_ptr<SSTable>& table, int level) const;
-  std::uint64_t OldestLiveWALFileNumberLocked() const;
+                                std::shared_ptr<SSTable>* table,
+                                SSTableMeta* meta);
+  Status RemoveObsoleteWALFiles(std::uint64_t oldest_live_wal);
   void SetBackgroundErrorLocked(Status status);
   Status MaybeCompact();
   Status CompactUnlocked();
@@ -129,11 +131,11 @@ class DB {
   void LogEvent(const std::string& message) const;
   std::filesystem::path SSTablePath(std::uint64_t number) const;
   std::filesystem::path WALPath(std::uint64_t number) const;
-  std::vector<SSTableMeta> CurrentSSTableMetas() const;
 
   Options options_;
   std::unique_ptr<WALWriter> wal_;
   std::uint64_t active_wal_file_number_ = 1;
+  std::uint64_t active_memtable_oldest_wal_file_number_ = 1;
   std::shared_ptr<MemTable> active_memtable_;
   std::deque<ImmutableMemTable> immutable_memtables_;
   std::vector<std::shared_ptr<SSTable>> sstables_;
@@ -141,6 +143,7 @@ class DB {
   std::shared_ptr<BlockCache> block_cache_;
   std::vector<std::unique_ptr<Snapshot>> snapshots_;
   std::uint64_t compaction_count_ = 0;
+  std::uint64_t sstable_full_scans_ = 0;
   std::thread background_worker_;
   std::condition_variable background_cv_;
   bool background_stop_ = false;

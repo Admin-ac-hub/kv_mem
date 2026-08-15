@@ -16,7 +16,7 @@
 - **崩溃安全基础设施**：WAL record、Manifest 和 SSTable DataBlock 都带 CRC32，损坏数据返回 `Corruption`，避免静默读错。
 - **读路径优化**：读取时先查 MemTable，再按新到旧查询 SSTable；SSTable 使用 Bloom Filter 跳过确定不存在的 key，通过内存 index 定位 DataBlock，并用 LRU Block Cache 缓存热点块。
 - **Compaction 语义**：实现简化 L0/L1/L2 leveled compaction；L0 可重叠，L1/L2 输出为不重叠 range，输入端使用 SSTable iterator 做流式 heap merge，合并时保留活跃 Snapshot 仍可见的历史版本，没有活跃 Snapshot 时清理旧版本和可丢弃 tombstone。
-- **Block 编码**：DataBlock 使用 restart interval 前缀压缩，`Get` 在 block 内通过 restart points 二分定位，再线性扫描一个 restart 区间；block trailer 记录 compression type 与 checksum，当前内置 none/fake codec，不依赖外部压缩库。
+- **Block 编码**：DataBlock 使用 restart interval 前缀压缩，`Get` 在 block 内通过 restart points 二分定位，再从最近的 restart point 顺序解码；block trailer 记录编码类型与 checksum，当前写入原始 payload，不保留无实际行为的 codec 抽象。
 - **事件日志**：`Options::enable_event_log` 开启后会输出 recovery、memtable switch、flush、compaction 和 Manifest append 等关键事件，默认关闭以保持测试和 benchmark 输出干净。
 - **可观测 benchmark**：输出 QPS、平均延迟、范围扫描条数、SSTable 数量、Compaction 次数、缓存命中/未命中、Bloom Filter 过滤次数、DataBlock 读取次数和目录大小。
 
@@ -79,10 +79,12 @@ Recovery:
 include/       public headers
 src/           storage engine implementation
 test/          unit tests
-test/test_dbs/ temporary DBs created by tests (ignored)
+stress/        concurrent randomized stress test
 bench/         benchmark binary
+cmake/         CMake helper modules
 scripts/       helper scripts for reproducible runs
 docs/          interview notes
+build/test_dbs/ temporary DBs created by CMake tests (ignored)
 ```
 
 数据库目录示例：
@@ -114,64 +116,52 @@ cmake --build build
 kv_test passed
 ```
 
-## 运行 benchmark
+## 运行压力测试
 
-单独运行：
+压力测试会按 epoch 启动多线程随机 `Put/Delete`，在 epoch barrier 处用 `NewIterator()` 和内存模型做全量对拍，并按配置周期执行 `Close()` / `Open()` 重新打开数据库后再次验证。它用于覆盖并发写入、tombstone、Flush/Compaction、Iterator 合并和 WAL/Manifest 恢复路径。
+
+本地运行默认 smoke：
 
 ```bash
-./build/kv_bench --path ./bench_db --write 100000 --value-size 100
-./build/kv_bench --path ./bench_db --read 100000
-./build/kv_bench --path ./bench_db --read-random 100000 --seed 1
-./build/kv_bench --path ./bench_db --scan 100000
-./build/kv_bench --path ./bench_db --mixed 100000 --value-size 100
+./scripts/stress_test.sh
 ```
 
-一键运行推荐场景：
+缩短参数快速验证：
+
+```bash
+EPOCHS=2 THREADS=2 OPS_PER_THREAD=200 ./scripts/stress_test.sh
+```
+
+Docker 运行：
+
+```bash
+docker build -t mini-lsm-kv-stress .
+docker run --rm mini-lsm-kv-stress
+```
+
+保留 stress DB 产物用于排查：
+
+```bash
+mkdir -p stress_runs
+docker run --rm \
+  -e STRESS_DB_PATH=/work/stress_db \
+  -v "$PWD/stress_runs:/work" \
+  mini-lsm-kv-stress
+```
+
+常用环境变量：`EPOCHS`、`THREADS`、`OPS_PER_THREAD`、`KEYS_PER_THREAD`、`VALUE_SIZE`、`DELETE_PERCENT`、`BATCH_SIZE`、`REOPEN_EVERY_EPOCHS`、`COMPACT_EVERY_EPOCHS`、`SEED`、`MEMTABLE_LIMIT`、`L0_LIMIT`。成功时会输出 `kv_stress passed`。
+
+## 运行 benchmark
+
+Benchmark 的 workload、指标定义、结果解释和复现说明统一维护在 [docs/BENCHMARK_ANALYSIS.md](docs/BENCHMARK_ANALYSIS.md)。一键脚本会在独立的 `build-bench/` 中使用 Release 配置运行推荐场景：
 
 ```bash
 ./scripts/run_benchmarks.sh
 ```
 
-benchmark 输出字段：
-
-```text
-writes: 100000
-reads: 0
-scan_items: 0
-elapsed_sec: ...
-qps: ...
-avg_latency_us: ...
-sstables: ...
-compactions: ...
-cache_hits: ...
-cache_misses: ...
-bloom_filtered: ...
-block_reads: ...
-db_size_bytes: ...
-```
-
-内部测试统计还覆盖 `sstable_full_scans` 与 `block_restart_seeks`，用于防止 compaction 回退到全表 materialize，以及防止 prefix-compressed block 读取绕过 restart point seek。
-
-### Benchmark 结果
-
-单线程，100K 操作，value 100 字节，macOS Apple Silicon：
-
-| 场景 | QPS | 平均延迟 | 说明 |
-|---|---|---|---|
-| 写入 | 21,800 | 46 μs | WAL fsync + MemTable + Flush |
-| 顺序读 | 13,100 | 76 μs | MemTable → SSTable + Block Cache |
-| 随机读 | 11,600 | 86 μs | Bloom Filter 过滤 + Block Cache |
-| 范围扫描 | 294,000 | 3.4 μs | MergingIterator 流式遍历 |
-| 混合读写 | 16,800 | 60 μs | 50% 写 + 50% 读 |
-
-观察：
-- 范围扫描吞吐最高，因为是纯内存顺序遍历，几乎没有磁盘 IO
-- 随机读比顺序读慢，因为 Bloom Filter 误判时需要额外磁盘读取
-- 写入受 WAL fsync 限制，每次写入都要持久化
-
 ## 面试讲解建议
 
-详细讲法见 [docs/INTERVIEW.md](docs/INTERVIEW.md)。建议重点讲 4 条线：
+详细讲法见 [docs/INTERVIEW.md](docs/INTERVIEW.md)。建议重点讲 5 条线：
 
 1. 为什么选择 LSM：顺序写 WAL + 批量 flush，牺牲读放大换写入吞吐。
 2. 写入如何保证可恢复：WAL 先于 MemTable，Manifest 记录版本，启动重放 WAL。
@@ -185,13 +175,12 @@ db_size_bytes: ...
 - Compaction 是简化版 L0/L1/L2 策略，尚未实现 LevelDB 的精细 picking、grandparent overlap 控制和多文件输出切分。
 - `DB` 已拆出 `write_mu_`、`memtable_mu_`、`version_mu_` 和 `bg_mu_`：写入按 WAL/sequence 串行，Get 只短暂持版本锁拿快照，读 MemTable 用 shared lock，SSTable I/O 不持 DB 全局状态锁，后台线程唤醒/停止信号由独立 bg 锁管理。
 - CRC32 用于损坏检测，不用于安全防篡改。
-- Block Compression 目前提供 none/fake codec 抽象，未引入 Snappy/Zstd。
-- 当前默认 compression type 是 none；fake codec 用于验证 codec 抽象边界，后续可替换为 Snappy/Zstd。
 
 ## 后续优化方向
 
 - 更完整的 Compaction：按 level score 选择文件、限制输出文件大小、控制 grandparent overlap。
 - 流式 SSTable Builder：当前 compaction 输入端已流式归并，输出端仍生成一个 vector 后调用 `CreateFromEntries`，后续可改成边归并边写 DataBlock。
-- 并发读写：进一步缩短 compaction/manifest 更新期间对版本锁的占用，并引入更系统的长时间压力测试。
+- 并发与故障测试：进一步缩短 compaction/manifest 更新期间对版本锁的占用，并增加进程异常退出、I/O 故障注入和长时间稳定性测试。
 - 更细的 fsync 策略：支持批量提交、可配置 durability。
 - 真实压缩库：接入 Snappy/Zstd 并做压缩率、CPU、cache 命中率权衡。
+- Benchmark 方法：多次运行取中位数，记录硬件、编译器与 commit，并增加参数化和多线程 workload。

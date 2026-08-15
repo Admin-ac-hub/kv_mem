@@ -1,0 +1,15 @@
+.git/
+.github/
+.claude/
+.idea/
+.VSCodeCounter/
+build/
+build-bench/
+cmake-build-*/
+bench_runs/
+stress_runs/
+bench_db/
+test/test_dbs/
+.DS_Store
+*.tmp
+*.log

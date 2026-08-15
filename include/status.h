@@ -7,17 +7,7 @@ namespace kv {
 
 class Status {
  public:
-  enum class Code {
-    kOk,
-    kNotFound,
-    kIOError,
-    kCorruption,
-    kInvalidArgument,
-  };
-
   Status() : code_(Code::kOk) {}
-  Status(Code code, std::string message)
-      : code_(code), message_(std::move(message)) {}
 
   static Status OK() { return Status(); }
   static Status NotFound(std::string message) {
@@ -40,6 +30,17 @@ class Status {
   std::string ToString() const;
 
  private:
+  enum class Code {
+    kOk,
+    kNotFound,
+    kIOError,
+    kCorruption,
+    kInvalidArgument,
+  };
+
+  Status(Code code, std::string message)
+      : code_(code), message_(std::move(message)) {}
+
   Code code_;
   std::string message_;
 };

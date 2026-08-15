@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -9,24 +10,19 @@
 #include "block_cache.h"
 #include "bloom_filter.h"
 #include "internal_iterator.h"
-#include "skiplist.h"
 #include "status.h"
 #include "types.h"
 
 namespace kv {
 
-class SSTable {
+class SSTable : public std::enable_shared_from_this<SSTable> {
  public:
   enum class ValueType : std::uint8_t {
     kPut = 1,
     kDelete = 2,
-    kMerge = 3,
   };
 
-  static constexpr const char* kTombstoneValue = "__DELETE__";
-
-  static Status CreateFromEntries(std::uint64_t file_number,
-                                  const std::filesystem::path& path,
+  static Status CreateFromEntries(const std::filesystem::path& path,
                                   const std::vector<VersionedEntry>& entries,
                                   size_t block_size = 4096,
                                   size_t bloom_bits_per_key = 10);
@@ -34,11 +30,11 @@ class SSTable {
                      const std::filesystem::path& path,
                      std::shared_ptr<BlockCache> block_cache,
                      std::shared_ptr<SSTable>* table);
+  ~SSTable();
 
   Status Get(const std::string& key,
              SequenceNumber read_sequence,
              std::optional<std::string>* value) const;
-  Status Get(const std::string& key, SequenceNumber read_sequence, std::string* value) const;
   Status Get(const std::string& key,
              SequenceNumber read_sequence,
              std::string* value,
@@ -49,9 +45,7 @@ class SSTable {
   const std::filesystem::path& FilePath() const;
   std::uint64_t BloomFilteredCount() const;
   std::uint64_t BlockReadCount() const;
-  std::uint64_t FullScanCount() const;
   std::uint64_t RestartSeekCount() const;
-  static std::uint64_t TotalFullScanCount();
 
  private:
   struct IndexEntry {
@@ -77,13 +71,13 @@ class SSTable {
 
   std::uint64_t file_number_;
   std::filesystem::path path_;
+  int fd_ = -1;
   std::vector<IndexEntry> index_;
   BloomFilter filter_;
   std::shared_ptr<BlockCache> block_cache_;
-  mutable std::uint64_t bloom_filtered_count_ = 0;
-  mutable std::uint64_t block_read_count_ = 0;
-  mutable std::uint64_t full_scan_count_ = 0;
-  mutable std::uint64_t restart_seek_count_ = 0;
+  mutable std::atomic<std::uint64_t> bloom_filtered_count_{0};
+  mutable std::atomic<std::uint64_t> block_read_count_{0};
+  mutable std::atomic<std::uint64_t> restart_seek_count_{0};
 };
 
 }  // namespace kv
