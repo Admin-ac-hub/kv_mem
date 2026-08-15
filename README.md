@@ -1,135 +1,204 @@
 # Mini LSM-KV
 
-一个用 C++17 实现的单机 LSM-Tree KV 存储引擎。项目目标不是复刻完整 LevelDB，而是把存储引擎面试里最核心的链路做完整：写前日志、MemTable、SSTable、Manifest、崩溃恢复、MVCC Snapshot、Iterator、Bloom Filter、Block Cache、Compaction 和可复现 benchmark。
+[![CI](https://github.com/Admin-ac-hub/kv_mem/actions/workflows/ci.yml/badge.svg)](https://github.com/Admin-ac-hub/kv_mem/actions/workflows/ci.yml)
 
-## 适合写在简历上的版本
+Mini LSM-KV 是一个基于 C++17 实现的单机持久化 KV 存储引擎。项目采用 LSM-Tree 架构，覆盖从 WAL、MemTable、SSTable 到 Manifest、崩溃恢复和分层 Compaction 的完整数据生命周期，并实现 MVCC Snapshot、范围扫描、缓存与数据完整性校验。
 
-> 基于 C++17 实现单机 LSM-Tree KV 存储引擎，支持 WriteBatch 原子提交、WAL batch 崩溃恢复、SkipList MemTable、immutable MemTable、后台 Flush、分块 SSTable、MVCC Snapshot、lazy MergingIterator 范围扫描、Bloom Filter、LRU Block Cache、追加式 Manifest VersionEdit、CURRENT/MANIFEST replay 与简化 L0/L1/L2 Compaction；为 WAL、SSTable DataBlock、Manifest 增加 CRC32 校验，并提供单元测试和 benchmark 统计 QPS、延迟、范围扫描吞吐、缓存命中、Bloom 过滤和磁盘占用。
+除核心引擎外，仓库还提供自动化测试、随机压力测试、Sanitizer CI 和 benchmark，用于验证并发正确性、持久化语义与读写性能。
 
-## 项目亮点
+## 核心特性
 
-- **完整写入链路**：`Put/Delete` 复用 `WriteBatch`，一次 WAL fsync 可提交多条 Put/Delete；active MemTable 达阈值后切成 immutable，前台写入进入新的 active MemTable。
-- **后台 Flush**：后台线程把 immutable MemTable 写成 L0 SSTable，Manifest fsync 成功后再清理旧 WAL；`Close()` 会 drain active/immutable，保证重启不丢数据。
-- **MVCC 一致性读**：每次写入分配递增 sequence number，WAL、MemTable、SSTable 和 Manifest 都持久化版本信息，Snapshot 按 sequence 读取稳定历史视图。
-- **范围扫描 Iterator**：`NewIterator()` 使用 MemTable/SSTable 子 iterator 和 heap-based MergingIterator 在线归并，支持 `SeekToFirst / Seek / Next`，并按 sequence 跳过旧版本和 tombstone。
-- **可恢复元数据**：Manifest 采用追加 VersionEdit log，CURRENT 指向当前 MANIFEST；启动时 replay edits 重建版本，并忽略不在 Manifest 中的 orphan SSTable。
-- **崩溃安全基础设施**：WAL record、Manifest 和 SSTable DataBlock 都带 CRC32，损坏数据返回 `Corruption`，避免静默读错。
-- **读路径优化**：读取时先查 MemTable，再按新到旧查询 SSTable；SSTable 使用 Bloom Filter 跳过确定不存在的 key，通过内存 index 定位 DataBlock，并用 LRU Block Cache 缓存热点块。
-- **Compaction 语义**：实现简化 L0/L1/L2 leveled compaction；L0 可重叠，L1/L2 输出为不重叠 range，输入端使用 SSTable iterator 做流式 heap merge，合并时保留活跃 Snapshot 仍可见的历史版本，没有活跃 Snapshot 时清理旧版本和可丢弃 tombstone。
-- **Block 编码**：DataBlock 使用 restart interval 前缀压缩，`Get` 在 block 内通过 restart points 二分定位，再从最近的 restart point 顺序解码；block trailer 记录编码类型与 checksum，当前写入原始 payload，不保留无实际行为的 codec 抽象。
-- **事件日志**：`Options::enable_event_log` 开启后会输出 recovery、memtable switch、flush、compaction 和 Manifest append 等关键事件，默认关闭以保持测试和 benchmark 输出干净。
-- **可观测 benchmark**：输出 QPS、平均延迟、范围扫描条数、SSTable 数量、Compaction 次数、缓存命中/未命中、Bloom Filter 过滤次数、DataBlock 读取次数和目录大小。
+| 方向 | 实现 |
+| --- | --- |
+| 写入路径 | 原子 `WriteBatch`、WAL append + fsync、SkipList MemTable、immutable MemTable、后台 Flush |
+| 持久化 | 分块 SSTable、追加式 Manifest VersionEdit、`CURRENT` 指针、WAL/Manifest replay |
+| 一致性 | 全局 sequence number、MVCC Snapshot、版本化 key、tombstone 可见性控制 |
+| 读取路径 | Bloom Filter、内存 Block Index、restart-point seek、LRU Block Cache |
+| 范围扫描 | MemTable/SSTable 子迭代器与 heap-based MergingIterator 在线归并 |
+| Compaction | 简化 L0/L1/L2 leveled compaction，处理重叠范围、历史版本和 tombstone |
+| 数据校验 | WAL record、Manifest record 和 SSTable DataBlock CRC32 校验 |
+| 工程验证 | 单元测试、并发随机压力测试、ASan/UBSan/TSan CI、可复现 benchmark |
 
-## 架构
+## 系统架构
 
 ```text
-Write:
-  Client
-    -> DB::Put/Delete/Write(WriteBatch)
-    -> WAL batch append + fsync
-    -> active SkipList MemTable
-    -> switch to immutable MemTable
-    -> background Flush
-    -> SSTable prefix-compressed data blocks + index + filter + footer
-    -> Manifest VersionEdit append + fsync
+Write path
 
-Read:
-  Client
-    -> DB::Get
-    -> MemTable
-    -> SSTable Bloom Filter
-    -> SSTable in-memory index
-    -> LRU Block Cache
-    -> DataBlock + CRC32 verify
+  Put / Delete / WriteBatch
+             |
+             v
+     WAL batch append + fsync
+             |
+             v
+    active SkipList MemTable
+             |
+        size threshold
+             |
+             v
+       immutable MemTable
+             |
+       background flush
+             |
+             v
+          L0 SSTable --------+
+             |               |
+             +--> Compaction +--> L1 / L2 SSTable
 
-Snapshot / Iterator:
-  DB::GetSnapshot
-    -> capture latest sequence number
-    -> ReadOptions
-    -> stable point-in-time Get / Iterator
 
-Recovery:
-  DB::Open
-    -> Read CURRENT
-    -> Replay Manifest VersionEdits
-    -> Open SSTables
-    -> Replay live WAL files
-    -> Rebuild MemTable
+Read path
+
+  Get / Snapshot / Iterator
+             |
+             v
+  active + immutable MemTable
+             |
+             v
+        SSTable version
+             |
+      Bloom Filter check
+             |
+       Block Index lookup
+             |
+        LRU Block Cache
+             |
+     DataBlock decode + CRC32
+
+
+Recovery path
+
+  CURRENT -> MANIFEST replay -> open live SSTables
+                                  |
+                                  v
+                         replay live WAL files
+                                  |
+                                  v
+                          rebuild MemTable state
 ```
 
-## 核心能力
+## 核心设计
 
-- API：`DB::Open / Close / Write / Put / Get / Delete / Compact / Stats / GetSnapshot / NewIterator`
-- WriteBatch：支持一次提交多个 Put/Delete，batch 内恢复原子性由 WAL batch record 保证
-- WAL：二进制 batch record，包含 magic/type、sequence、count、payload size、CRC32 和 payload
-- MemTable：基于 SkipList，按 user key + sequence 保存多版本记录
-- SSTable：DataBlock + IndexBlock + FilterBlock + Footer 格式
-- Block Index：打开 SSTable 时加载到内存，读请求通过 `lower_bound` 定位 block
-- Snapshot：捕获当前 sequence number，支持稳定历史读视图
-- Iterator：多路在线归并 active/immutable/SSTable iterator，在读视图下输出 key 升序的最新可见非删除版本
-- Bloom Filter：按 SSTable 构建，减少无效磁盘 block 读取
-- Block Cache：进程内 LRU 缓存热点 DataBlock
-- Manifest：追加 VersionEdit log，记录 WAL、file number、SSTable level/range/size，CURRENT 损坏或缺失会返回明确错误或触发目录恢复
-- Compaction：简化 L0/L1/L2 leveled compaction，使用 SSTable iterator 流式归并输入，感知活跃 Snapshot，避免清理仍可见版本
-- 测试：覆盖 WAL batch 恢复、截断 WAL、后台 Flush、版本覆盖、删除语义、Snapshot、lazy Iterator、Manifest replay/截断/orphan、CRC 损坏检测、Bloom/Cache 统计、Compaction、Prefix Compression 和并发 Put/Get
+### 写入与原子提交
 
-## 目录结构
+`Put` 和 `Delete` 统一转换为 `WriteBatch`。每个 batch 在提交时获得连续的 sequence number，并编码为一条 WAL batch record。只有 WAL append 和 fsync 成功后，batch 才会写入 MemTable，因此恢复过程不会看到半个 batch。
+
+active MemTable 达到容量阈值后会切换为 immutable MemTable。前台写入立即进入新的 active MemTable，后台线程负责将 immutable MemTable 刷写为 L0 SSTable。新版本在 Manifest 持久化成功后才对恢复流程生效，旧 WAL 也只会在对应数据安全进入 SSTable 后清理。
+
+### SSTable 与 Block 格式
+
+SSTable 由 DataBlock、IndexBlock、FilterBlock 和 Footer 组成：
+
+- DataBlock 保存按 `user key + sequence` 排序的版本化记录。
+- 相邻 key 使用 restart interval 前缀压缩，降低重复前缀带来的空间开销。
+- Block Index 常驻内存，通过 `lower_bound` 定位候选 DataBlock。
+- Bloom Filter 用于快速排除确定不存在的 key，减少无效 block 读取。
+- DataBlock trailer 保存编码类型和 CRC32，读取时校验数据完整性。
+- LRU Block Cache 缓存热点 DataBlock，并记录 hit、miss 和实际 block read 指标。
+
+点查在 block 内先对 restart points 二分搜索，再从最近的 restart point 顺序解码，避免扫描整个 DataBlock。
+
+### MVCC 与范围扫描
+
+每次写入分配单调递增的 sequence number。Snapshot 捕获创建时的最新 sequence，读取时只选择 `sequence <= read_sequence` 的最新版本，从而获得稳定的时间点视图。
+
+`NewIterator()` 不会预先物化整个数据库。它为 active MemTable、immutable MemTable 和各 SSTable 创建子迭代器，再通过最小堆在线归并；同一个 user key 的旧版本和不可见 tombstone 会在归并过程中被跳过。接口支持 `SeekToFirst`、`Seek`、`Next`、`Valid`、`key`、`value` 和 `status`。
+
+### Manifest 与崩溃恢复
+
+Manifest 使用追加式 VersionEdit 记录 file number、当前 WAL、SSTable level、key range 和文件大小，`CURRENT` 文件指向当前 MANIFEST。启动流程按以下顺序恢复状态：
+
+1. 读取 `CURRENT` 并定位 MANIFEST。
+2. replay VersionEdit，重建存储版本和 live file 集合。
+3. 打开 Manifest 引用的 SSTable，忽略未发布的 orphan SSTable。
+4. replay 仍存活的 WAL batch，恢复尚未 Flush 的记录。
+5. 恢复 sequence 与 file number 分配器，继续接受写入。
+
+WAL、Manifest 或 SSTable 校验失败时返回明确的 `Corruption`，避免静默使用损坏数据。
+
+### Compaction
+
+当前实现简化的 L0/L1/L2 leveled compaction：L0 文件允许 key range 重叠；向 L1/L2 输出时合并目标层的重叠文件，并维护非重叠 range。输入端使用 SSTable iterator 和最小堆做流式归并，避免一次性加载全部 SSTable 内容。
+
+Compaction 会清理被覆盖的历史版本，但必须保留活跃 Snapshot 仍然可见的记录。tombstone 只有在确认更低层不存在需要屏蔽的旧值时才能删除。
+
+### 并发模型
+
+引擎使用职责分离的锁控制共享状态：
+
+| 锁 | 保护范围 |
+| --- | --- |
+| `write_mu_` | WAL append、sequence 分配和写入顺序 |
+| `memtable_mu_` | active/immutable MemTable 的并发访问 |
+| `version_mu_` | Manifest、SSTable 版本与 Snapshot 列表 |
+| `bg_mu_` | 后台 Flush/Compaction 的唤醒和停止状态 |
+
+读取在拿到 MemTable 和 SSTable 版本快照后释放全局版本锁，SSTable I/O 不长期占用 DB 状态锁。读请求通过 `shared_ptr` pin 当前 SSTable 版本，因此 Compaction 发布新版本并删除旧文件时，已经开始的读取仍可安全完成。`Close()` 会停止后台线程并 drain 未完成的 immutable MemTable，确保资源释放与目录清理之间没有竞态。
+
+## 文件布局
+
+一个数据库目录包含以下文件：
 
 ```text
-include/       public headers
-src/           storage engine implementation
-test/          unit tests
-stress/        concurrent randomized stress test
-bench/         benchmark binary
-cmake/         CMake helper modules
-scripts/       helper scripts for reproducible runs
-docs/          interview notes
-build/test_dbs/ temporary DBs created by CMake tests (ignored)
-```
-
-数据库目录示例：
-
-```text
-MANIFEST
 CURRENT
+MANIFEST
 wal_000003.log
-sst_000001.data
-sst_000002.data
+sst_000004.data
+sst_000005.data
 ```
 
-## 编译
-
-```bash
-cmake -S . -B build
-cmake --build build
-```
-
-## 运行测试
-
-```bash
-./build/kv_test
-```
-
-期望输出：
+源码目录：
 
 ```text
-kv_test passed
+include/    public headers
+src/        storage engine implementation
+test/       deterministic unit and concurrency tests
+stress/     randomized concurrent model-based stress test
+bench/      benchmark workloads
+cmake/      CMake helper modules
+scripts/    benchmark and stress-test entrypoints
+docs/       design notes and benchmark analysis
 ```
 
-## 运行压力测试
+## 构建与测试
 
-压力测试会按 epoch 启动多线程随机 `Put/Delete`，在 epoch barrier 处用 `NewIterator()` 和内存模型做全量对拍，并按配置周期执行 `Close()` / `Open()` 重新打开数据库后再次验证。它用于覆盖并发写入、tombstone、Flush/Compaction、Iterator 合并和 WAL/Manifest 恢复路径。
+依赖 CMake 3.16+ 和支持 C++17 的编译器。
 
-本地运行默认 smoke：
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+启用 AddressSanitizer 和 UndefinedBehaviorSanitizer：
+
+```bash
+cmake -S . -B build-sanitized \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DKV_SANITIZERS=address,undefined
+cmake --build build-sanitized --parallel
+ctest --test-dir build-sanitized --output-on-failure
+```
+
+GitHub Actions 会在 Ubuntu 和 macOS 上运行 Debug/Release 构建，并额外执行 ASan、UBSan 和 TSan 检查。
+
+## 随机压力测试
+
+压力测试使用多线程随机生成 `Put`、`Delete` 和 `WriteBatch`，每个 epoch 都会通过 `NewIterator()` 与内存模型进行全量对拍，并周期性执行 reopen 和 Compaction，覆盖并发写入、后台 Flush、tombstone、恢复与迭代器归并路径。
 
 ```bash
 ./scripts/stress_test.sh
 ```
 
-缩短参数快速验证：
+可通过环境变量调整 workload：
 
 ```bash
-EPOCHS=2 THREADS=2 OPS_PER_THREAD=200 ./scripts/stress_test.sh
+EPOCHS=20 \
+THREADS=8 \
+OPS_PER_THREAD=5000 \
+REOPEN_EVERY_EPOCHS=2 \
+COMPACT_EVERY_EPOCHS=3 \
+./scripts/stress_test.sh
 ```
 
 Docker 运行：
@@ -139,48 +208,77 @@ docker build -t mini-lsm-kv-stress .
 docker run --rm mini-lsm-kv-stress
 ```
 
-保留 stress DB 产物用于排查：
+## Benchmark
 
-```bash
-mkdir -p stress_runs
-docker run --rm \
-  -e STRESS_DB_PATH=/work/stress_db \
-  -v "$PWD/stress_runs:/work" \
-  mini-lsm-kv-stress
-```
+Benchmark 覆盖写入、顺序读、随机读、范围扫描和混合读写 workload，输出以下指标：
 
-常用环境变量：`EPOCHS`、`THREADS`、`OPS_PER_THREAD`、`KEYS_PER_THREAD`、`VALUE_SIZE`、`DELETE_PERCENT`、`BATCH_SIZE`、`REOPEN_EVERY_EPOCHS`、`COMPACT_EVERY_EPOCHS`、`SEED`、`MEMTABLE_LIMIT`、`L0_LIMIT`。成功时会输出 `kv_stress passed`。
-
-## 运行 benchmark
-
-Benchmark 的 workload、指标定义、结果解释和复现说明统一维护在 [docs/BENCHMARK_ANALYSIS.md](docs/BENCHMARK_ANALYSIS.md)。一键脚本会在独立的 `build-bench/` 中使用 Release 配置运行推荐场景：
+- QPS 与平均延迟
+- 范围扫描吞吐
+- SSTable 数量与 Compaction 次数
+- Block Cache hit/miss
+- Bloom Filter 过滤次数
+- DataBlock 实际读取次数
+- 数据库目录占用空间
 
 ```bash
 ./scripts/run_benchmarks.sh
 ```
 
-## 面试讲解建议
+workload 定义、指标解释和结果分析见 [docs/BENCHMARK_ANALYSIS.md](docs/BENCHMARK_ANALYSIS.md)。性能结果与硬件、文件系统、编译器和 OS page cache 强相关，比较时应固定 commit 和测试环境并进行多轮采样。
 
-详细讲法见 [docs/INTERVIEW.md](docs/INTERVIEW.md)。建议重点讲 5 条线：
+## API 概览
 
-1. 为什么选择 LSM：顺序写 WAL + 批量 flush，牺牲读放大换写入吞吐。
-2. 写入如何保证可恢复：WAL 先于 MemTable，Manifest 记录版本，启动重放 WAL。
-3. MVCC 如何支持 Snapshot：sequence number、读视图、tombstone 可见性。
-4. 读路径如何优化：MemTable、Bloom Filter、IndexBlock、Block Cache 的层层过滤。
-5. Compaction 解决什么问题：合并多份 SSTable，消除旧版本和 tombstone，同时保护活跃 Snapshot。
+```cpp
+#include <string>
 
-## 当前限制
+#include "db.h"
+#include "write_batch.h"
 
-- 只实现单进程写入，不支持多个 DB 实例同时写同一路径。
-- Compaction 是简化版 L0/L1/L2 策略，尚未实现 LevelDB 的精细 picking、grandparent overlap 控制和多文件输出切分。
-- `DB` 已拆出 `write_mu_`、`memtable_mu_`、`version_mu_` 和 `bg_mu_`：写入按 WAL/sequence 串行，Get 只短暂持版本锁拿快照，读 MemTable 用 shared lock，SSTable I/O 不持 DB 全局状态锁，后台线程唤醒/停止信号由独立 bg 锁管理。
-- CRC32 用于损坏检测，不用于安全防篡改。
+int main() {
+  kv::DB db("./example_db");
+  if (!db.Open().ok()) {
+    return 1;
+  }
 
-## 后续优化方向
+  if (!db.Put("user:1", "alice").ok()) {
+    return 1;
+  }
 
-- 更完整的 Compaction：按 level score 选择文件、限制输出文件大小、控制 grandparent overlap。
-- 流式 SSTable Builder：当前 compaction 输入端已流式归并，输出端仍生成一个 vector 后调用 `CreateFromEntries`，后续可改成边归并边写 DataBlock。
-- 并发与故障测试：进一步缩短 compaction/manifest 更新期间对版本锁的占用，并增加进程异常退出、I/O 故障注入和长时间稳定性测试。
-- 更细的 fsync 策略：支持批量提交、可配置 durability。
-- 真实压缩库：接入 Snappy/Zstd 并做压缩率、CPU、cache 命中率权衡。
-- Benchmark 方法：多次运行取中位数，记录硬件、编译器与 commit，并增加参数化和多线程 workload。
+  kv::WriteBatch batch;
+  batch.Put("user:2", "bob");
+  batch.Delete("user:1");
+  if (!db.Write(batch).ok()) {
+    return 1;
+  }
+
+  const kv::Snapshot* snapshot = db.GetSnapshot();
+  kv::ReadOptions options;
+  options.snapshot = snapshot;
+
+  std::string value;
+  if (!db.Get("user:2", &value, options).ok()) {
+    return 1;
+  }
+  db.ReleaseSnapshot(snapshot);
+
+  return db.Close().ok() ? 0 : 1;
+}
+```
+
+主要接口包括 `Open`、`Close`、`Write`、`Put`、`Get`、`Delete`、`Compact`、`Stats`、`GetSnapshot` 和 `NewIterator`。
+
+## 当前边界
+
+- 单进程存储引擎，同一路径不支持多个 `DB` 实例并发写入。
+- Compaction 尚未实现完整的 level score、grandparent overlap 控制和多文件输出切分。
+- Compaction 输入端已流式归并，输出端仍会先构建内存 vector 再生成 SSTable。
+- 每个 WriteBatch 默认执行一次 WAL fsync，尚未实现 writer queue、group commit 和可配置 durability。
+- DataBlock 已保留编码类型，但当前只写入原始 payload，尚未接入 Snappy 或 Zstd。
+
+## 后续方向
+
+- 实现按 level score 和文件 overlap 选择输入的 Compaction Picker。
+- 增加流式 SSTable Builder 和目标文件大小控制。
+- 实现 writer queue、group commit 与可配置同步策略。
+- 接入 Snappy/Zstd，对比压缩率、CPU 开销与缓存命中率。
+- 增加进程异常退出、I/O 故障注入和长时间稳定性测试。
