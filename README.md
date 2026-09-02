@@ -17,7 +17,31 @@ Mini LSM-KV 是一个基于 C++17 实现的单机持久化 KV 存储引擎。项
 | 范围扫描 | MemTable/SSTable 子迭代器与 heap-based MergingIterator 在线归并 |
 | Compaction | 简化 L0/L1/L2 leveled compaction，处理重叠范围、历史版本和 tombstone |
 | 数据校验 | WAL record、Manifest record 和 SSTable DataBlock CRC32 校验 |
+| 向量存储 | Float32 固定维度向量、JSON metadata、L2/IP/Cosine 精确 Top-K 基线 |
+| ANN 索引 | 内存 HNSW、增量插入、分层 beam search、可配置 `M`/`ef` |
 | 工程验证 | 单元测试、并发随机压力测试、ASan/UBSan/TSan CI、可复现 benchmark |
+
+### 向量存储（第一阶段）
+
+向量记录与普通 KV 共用 WAL、MemTable、SSTable、MVCC Snapshot 和
+Compaction 路径。`Options::vector_dimension` 可约束数据库中的固定向量维度；
+设为 `0` 时不在写入阶段强制维度，但每次搜索仍只比较与查询同维的向量。
+metadata 作为不透明字符串持久化，调用方负责保证传入内容是合法 JSON。
+
+当前 `BruteForceSearch` 会扫描快照中的最新可见记录，并使用有界 Top-K 堆返回
+精确结果，可作为后续 HNSW 的 Recall 基线。距离统一采用值越小越相近的语义：
+L2 返回欧氏距离，Inner Product 返回负内积，Cosine 返回 `1 - cosine_similarity`。
+
+### HNSW 索引（第二阶段）
+
+`HNSWIndex` 实现了独立的内存 ANN 索引，包括指数分布随机层级、上层贪心下降、
+层内 beam search、启发式邻居选择和双向连边。`HNSWOptions` 可配置固定维度、
+`max_neighbors`、`ef_construction`、距离类型和随机种子；查询通过
+`ef_search` 控制召回率与延迟的权衡。插入使用独占锁，查询使用共享锁。
+
+固定种子的 `1000 x 128` 测试会以精确搜索为基线验证 `Recall@10 > 0.90`，
+并检查平均查询延迟低于 1 ms。`DB::Search` 已接入内存 HNSW，并在查询阶段按
+LSM 的最新版本、tombstone 和 snapshot 过滤结果；索引持久化仍属于后续阶段。
 
 ## 系统架构
 
@@ -230,17 +254,33 @@ workload 定义、指标解释和结果分析见 [docs/BENCHMARK_ANALYSIS.md](do
 
 ```cpp
 #include <string>
+#include <vector>
 
 #include "db.h"
+#include "vector_value.h"
 #include "write_batch.h"
 
 int main() {
-  kv::DB db("./example_db");
+  kv::Options db_options;
+  db_options.db_path = "./example_db";
+  db_options.vector_dimension = 3;
+  kv::DB db(db_options);
   if (!db.Open().ok()) {
     return 1;
   }
 
   if (!db.Put("user:1", "alice").ok()) {
+    return 1;
+  }
+
+  if (!db.PutVector("doc:1", {1.0f, 0.0f, 0.0f},
+                    R"({"category":"tech"})").ok()) {
+    return 1;
+  }
+
+  std::vector<kv::VectorResult> nearest;
+  if (!db.BruteForceSearch({0.9f, 0.1f, 0.0f}, 10, &nearest,
+                           kv::VectorDistanceMetric::kCosine).ok()) {
     return 1;
   }
 
@@ -265,7 +305,9 @@ int main() {
 }
 ```
 
-主要接口包括 `Open`、`Close`、`Write`、`Put`、`Get`、`Delete`、`Compact`、`Stats`、`GetSnapshot` 和 `NewIterator`。
+主要接口包括 `Open`、`Close`、`Write`、`Put`、`Get`、`PutVector`、
+`GetVector`、`BruteForceSearch`、`Search`、`Delete`、`Compact`、`Stats`、
+`GetSnapshot` 和 `NewIterator`。
 
 ## 当前边界
 
@@ -274,6 +316,7 @@ int main() {
 - Compaction 输入端已流式归并，输出端仍会先构建内存 vector 再生成 SSTable。
 - 每个 WriteBatch 默认执行一次 WAL fsync，尚未实现 writer queue、group commit 和可配置 durability。
 - DataBlock 已保留编码类型，但当前只写入原始 payload，尚未接入 Snappy 或 Zstd。
+- HNSW 当前仅为内存索引；LSM 多版本、tombstone 和并发查询已接入，索引文件持久化与重启加载尚未实现。
 
 ## 后续方向
 
@@ -282,3 +325,4 @@ int main() {
 - 实现 writer queue、group commit 与可配置同步策略。
 - 接入 Snappy/Zstd，对比压缩率、CPU 开销与缓存命中率。
 - 增加进程异常退出、I/O 故障注入和长时间稳定性测试。
+- 在 Flush/Compaction 时持久化或重建 HNSW 索引，并补充索引文件恢复。

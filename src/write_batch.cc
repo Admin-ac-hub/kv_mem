@@ -23,6 +23,19 @@ void WriteBatch::Put(std::string key, std::string value) {
       WriteBatchOperation{WriteBatchOpType::kPut, std::move(key), std::move(value)});
 }
 
+Status WriteBatch::PutVector(std::string key,
+                             const std::vector<float>& vector,
+                             std::string metadata) {
+  std::string encoded;
+  Status status = EncodeVectorValue(vector, metadata, &encoded);
+  if (!status.ok()) {
+    return status;
+  }
+  operations_.push_back(WriteBatchOperation{
+      WriteBatchOpType::kPutVector, std::move(key), std::move(encoded)});
+  return Status::OK();
+}
+
 void WriteBatch::Delete(std::string key) {
   operations_.push_back(WriteBatchOperation{WriteBatchOpType::kDelete, std::move(key), ""});
 }
@@ -58,7 +71,8 @@ Status WriteBatch::Decode(std::string_view encoded) {
     }
 
     const auto type = static_cast<WriteBatchOpType>(static_cast<std::uint8_t>(ptr[0]));
-    if (type != WriteBatchOpType::kPut && type != WriteBatchOpType::kDelete) {
+    if (type != WriteBatchOpType::kPut && type != WriteBatchOpType::kDelete &&
+        type != WriteBatchOpType::kPutVector) {
       return Status::Corruption("unknown WriteBatch operation type");
     }
 
@@ -78,6 +92,13 @@ Status WriteBatch::Decode(std::string_view encoded) {
 
     if (operation.type == WriteBatchOpType::kDelete && !operation.value.empty()) {
       return Status::Corruption("delete operation carries a value");
+    }
+    if (operation.type == WriteBatchOpType::kPutVector) {
+      VectorRecord record;
+      Status status = DecodeVectorValue(operation.value, &record);
+      if (!status.ok()) {
+        return Status::Corruption("invalid vector value in WriteBatch");
+      }
     }
     decoded.push_back(std::move(operation));
   }

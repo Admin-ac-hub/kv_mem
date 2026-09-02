@@ -7,12 +7,14 @@
 #include <vector>
 
 #include "status.h"
+#include "vector_value.h"
 
 namespace kv {
 
 enum class WriteBatchOpType : std::uint8_t {
   kPut = 1,
   kDelete = 2,
+  kPutVector = 3,
 };
 
 struct WriteBatchOperation {
@@ -24,6 +26,9 @@ struct WriteBatchOperation {
 class WriteBatch {
  public:
   void Put(std::string key, std::string value);
+  Status PutVector(std::string key,
+                   const std::vector<float>& vector,
+                   std::string metadata = {});
   void Delete(std::string key);
   void Clear();
   size_t Count() const;

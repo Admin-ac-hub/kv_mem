@@ -14,10 +14,12 @@ add_library(kvdb
     src/bloom_filter.cc
     src/db.cc
     src/format.cc
+    src/hnsw_index.cc
     src/manifest.cpp
     src/memtable.cc
     src/sstable.cpp
     src/skiplist.cc
+    src/vector_value.cc
     src/wal.cc
     src/write_batch.cc
 )
@@ -34,6 +36,13 @@ if(BUILD_TESTING)
 
     add_test(NAME kv_test COMMAND kv_test)
     set_tests_properties(kv_test PROPERTIES TIMEOUT 60)
+
+    add_executable(hnsw_test test/hnsw_test.cc)
+    target_link_libraries(hnsw_test PRIVATE kvdb)
+    target_compile_options(hnsw_test PRIVATE -Wall -Wextra -Wpedantic)
+
+    add_test(NAME hnsw_test COMMAND hnsw_test)
+    set_tests_properties(hnsw_test PROPERTIES TIMEOUT 60)
 endif()
 
 add_executable(kv_bench bench/kv_bench.cpp)

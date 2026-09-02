@@ -316,7 +316,16 @@ Status DB::Open() {
   }
   std::filesystem::create_directories(options_.db_path);
 
-  active_memtable_ = std::make_shared<MemTable>();
+  vector_index_.reset();
+  if (options_.vector_dimension != 0) {
+    HNSWOptions hnsw_options;
+    hnsw_options.dimension = options_.vector_dimension;
+    hnsw_options.max_neighbors = options_.hnsw_max_neighbors;
+    hnsw_options.ef_construction = options_.hnsw_ef_construction;
+    hnsw_options.metric = options_.vector_distance_metric;
+    vector_index_ = std::make_shared<HNSWIndex>(hnsw_options);
+  }
+  active_memtable_ = std::make_shared<MemTable>(vector_index_);
   immutable_memtables_.clear();
   wal_.reset();
   {
@@ -334,6 +343,10 @@ Status DB::Open() {
   }
 
   status = OpenSSTables();
+  if (!status.ok()) {
+    return status;
+  }
+  status = RebuildVectorIndex();
   if (!status.ok()) {
     return status;
   }
@@ -377,7 +390,7 @@ Status DB::Close() {
       immutable_memtables_.push_back(
           ImmutableMemTable{std::move(active_memtable_),
                             active_memtable_oldest_wal_file_number_});
-      active_memtable_ = std::make_shared<MemTable>();
+      active_memtable_ = std::make_shared<MemTable>(vector_index_);
       moved_active_memtable = true;
     } else if (wal_ != nullptr) {
       wal_->Close();
@@ -442,6 +455,28 @@ Status DB::Write(const WriteBatch& batch) {
       case WriteBatchOpType::kPut:
       case WriteBatchOpType::kDelete:
         break;
+      case WriteBatchOpType::kPutVector: {
+        VectorRecord record;
+        status = DecodeVectorValue(operation.value, &record);
+        if (!status.ok()) {
+          return status;
+        }
+        if (options_.vector_dimension != 0 &&
+            record.vector.size() != options_.vector_dimension) {
+          return Status::InvalidArgument(
+              "vector dimension does not match configured dimension");
+        }
+        if (vector_index_ != nullptr) {
+          float ignored_distance = 0.0f;
+          status = ComputeVectorDistance(record.vector, record.vector,
+                                         options_.vector_distance_metric,
+                                         &ignored_distance);
+          if (!status.ok()) {
+            return status;
+          }
+        }
+        break;
+      }
       default:
         return Status::InvalidArgument("unknown WriteBatch operation type");
     }
@@ -459,11 +494,19 @@ Status DB::Write(const WriteBatch& batch) {
     for (const auto& operation : batch.Operations()) {
       switch (operation.type) {
         case WriteBatchOpType::kPut:
-          active_memtable_->Put(operation.key, sequence, operation.value);
+          status = active_memtable_->Put(operation.key, sequence,
+                                         operation.value);
+          break;
+        case WriteBatchOpType::kPutVector:
+          status = active_memtable_->PutVector(operation.key, sequence,
+                                               operation.value);
           break;
         case WriteBatchOpType::kDelete:
-          active_memtable_->Delete(operation.key, sequence);
+          status = active_memtable_->Delete(operation.key, sequence);
           break;
+      }
+      if (!status.ok()) {
+        return status;
       }
       manifest_->SetLastSequence(sequence);
       ++sequence;
@@ -480,11 +523,21 @@ Status DB::Put(const std::string& key, const std::string& value) {
   return Write(batch);
 }
 
-Status DB::Get(const std::string& key, std::string* value) {
-  return Get(key, value, ReadOptions{});
+Status DB::PutVector(const std::string& key,
+                     const std::vector<float>& vector,
+                     const std::string& metadata) {
+  WriteBatch batch;
+  Status status = batch.PutVector(key, vector, metadata);
+  if (!status.ok()) {
+    return status;
+  }
+  return Write(batch);
 }
 
 Status DB::Get(const std::string& key, std::string* value, const ReadOptions& options) {
+  if (value == nullptr) {
+    return Status::InvalidArgument("value output cannot be null");
+  }
   Status status = ValidateKey(key);
   if (!status.ok()) {
     return status;
@@ -549,6 +602,155 @@ Status DB::Get(const std::string& key, std::string* value, const ReadOptions& op
   }
 
   return Status::NotFound("key not found");
+}
+
+Status DB::GetVector(const std::string& key,
+                     VectorRecord* record,
+                     const ReadOptions& options) {
+  if (record == nullptr) {
+    return Status::InvalidArgument("vector record output cannot be null");
+  }
+  std::string encoded;
+  Status status = Get(key, &encoded, options);
+  if (!status.ok()) {
+    return status;
+  }
+  status = DecodeVectorValue(encoded, record);
+  if (!status.ok()) {
+    return status;
+  }
+  if (options_.vector_dimension != 0 &&
+      record->vector.size() != options_.vector_dimension) {
+    return Status::Corruption(
+        "stored vector dimension does not match configured dimension");
+  }
+  record->key = key;
+  return Status::OK();
+}
+
+Status DB::BruteForceSearch(const std::vector<float>& query,
+                            size_t top_k,
+                            std::vector<VectorResult>* results,
+                            VectorDistanceMetric metric,
+                            const ReadOptions& options) {
+  if (results == nullptr) {
+    return Status::InvalidArgument("search results output cannot be null");
+  }
+  results->clear();
+
+  float validation_distance = 0.0f;
+  Status status = ComputeVectorDistance(query, query, metric,
+                                        &validation_distance);
+  if (!status.ok()) {
+    return status;
+  }
+  if (options_.vector_dimension != 0 &&
+      query.size() != options_.vector_dimension) {
+    return Status::InvalidArgument(
+        "query dimension does not match configured dimension");
+  }
+  if (top_k == 0) {
+    return Status::OK();
+  }
+
+  struct ResultBetter {
+    bool operator()(const VectorResult& lhs, const VectorResult& rhs) const {
+      if (lhs.distance != rhs.distance) {
+        return lhs.distance < rhs.distance;
+      }
+      return lhs.key < rhs.key;
+    }
+  };
+  std::priority_queue<VectorResult, std::vector<VectorResult>, ResultBetter>
+      nearest;
+
+  auto iterator = NewIterator(options);
+  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
+    if (!IsEncodedVectorValue(iterator->value())) {
+      continue;
+    }
+
+    VectorRecord record;
+    status = DecodeVectorValue(iterator->value(), &record);
+    if (!status.ok()) {
+      return status;
+    }
+    if (record.vector.size() != query.size()) {
+      if (options_.vector_dimension != 0) {
+        return Status::Corruption(
+            "stored vector dimension does not match configured dimension");
+      }
+      continue;
+    }
+
+    float distance = 0.0f;
+    status = ComputeVectorDistance(query, record.vector, metric, &distance);
+    if (!status.ok()) {
+      return status;
+    }
+    VectorResult candidate{iterator->key(), distance, std::move(record.metadata)};
+    if (nearest.size() < top_k) {
+      nearest.push(std::move(candidate));
+    } else if (ResultBetter{}(candidate, nearest.top())) {
+      nearest.pop();
+      nearest.push(std::move(candidate));
+    }
+  }
+  status = iterator->status();
+  if (!status.ok()) {
+    results->clear();
+    return status;
+  }
+
+  results->reserve(nearest.size());
+  while (!nearest.empty()) {
+    results->push_back(nearest.top());
+    nearest.pop();
+  }
+  std::sort(results->begin(), results->end(),
+            [](const VectorResult& lhs, const VectorResult& rhs) {
+              if (lhs.distance != rhs.distance) {
+                return lhs.distance < rhs.distance;
+              }
+              return lhs.key < rhs.key;
+            });
+  return Status::OK();
+}
+
+Status DB::Search(const std::vector<float>& query,
+                  size_t top_k,
+                  size_t ef_search,
+                  std::vector<VectorResult>* results,
+                  const ReadOptions& options) {
+  if (results == nullptr) {
+    return Status::InvalidArgument("search results output cannot be null");
+  }
+  results->clear();
+
+  std::shared_ptr<HNSWIndex> index;
+  SequenceNumber read_sequence = 0;
+  {
+    std::lock_guard<std::mutex> lock(version_mu_);
+    if (closed_) {
+      return Status::IOError("database is not open");
+    }
+    if (vector_index_ == nullptr) {
+      return Status::InvalidArgument(
+          "indexed search requires a configured vector dimension");
+    }
+    index = vector_index_;
+    read_sequence = ReadSequence(options);
+  }
+
+  return index->SearchAtSequence(query, top_k, ef_search, read_sequence,
+                                 results);
+}
+
+Status DB::Search(const std::vector<float>& query,
+                  size_t top_k,
+                  std::vector<VectorResult>* results,
+                  const ReadOptions& options) {
+  return Search(query, top_k, 64, results, options);
 }
 
 Status DB::Delete(const std::string& key) {
@@ -920,6 +1122,48 @@ Status DB::OpenSSTables() {
   return Status::OK();
 }
 
+Status DB::AddVectorIndexEntry(const VersionedEntry& entry) {
+  if (vector_index_ == nullptr) {
+    return Status::OK();
+  }
+  if (entry.deleted || !IsEncodedVectorValue(entry.value)) {
+    return vector_index_->MarkDeleted(entry.key, entry.sequence);
+  }
+
+  VectorRecord record;
+  Status status = DecodeVectorValue(entry.value, &record);
+  if (!status.ok()) {
+    return status;
+  }
+  if (record.vector.size() != options_.vector_dimension) {
+    return Status::Corruption(
+        "stored vector dimension does not match configured dimension");
+  }
+  return vector_index_->InsertVersion(entry.key, entry.sequence,
+                                      record.vector, record.metadata);
+}
+
+Status DB::RebuildVectorIndex() {
+  if (vector_index_ == nullptr) {
+    return Status::OK();
+  }
+  for (const auto& table : sstables_) {
+    std::vector<VersionedEntry> entries;
+    ++sstable_full_scans_;
+    Status status = table->Entries(&entries);
+    if (!status.ok()) {
+      return status;
+    }
+    for (const auto& entry : entries) {
+      status = AddVectorIndexEntry(entry);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+  }
+  return Status::OK();
+}
+
 Status DB::Recover() {
   std::vector<std::pair<std::uint64_t, std::filesystem::path>> wal_files;
   const std::uint64_t oldest_live_wal = manifest_->WALFileNumber();
@@ -975,11 +1219,30 @@ Status DB::Recover() {
       for (const auto& operation : record.batch.Operations()) {
         switch (operation.type) {
           case WriteBatchOpType::kPut:
-            active_memtable_->Put(operation.key, sequence, operation.value);
+            status = active_memtable_->Put(operation.key, sequence,
+                                           operation.value);
             break;
+          case WriteBatchOpType::kPutVector: {
+            VectorRecord vector_record;
+            status = DecodeVectorValue(operation.value, &vector_record);
+            if (!status.ok()) {
+              return status;
+            }
+            if (options_.vector_dimension != 0 &&
+                vector_record.vector.size() != options_.vector_dimension) {
+              return Status::InvalidArgument(
+                  "recovered vector dimension does not match configured dimension");
+            }
+            status = active_memtable_->PutVector(operation.key, sequence,
+                                                 operation.value);
+            break;
+          }
           case WriteBatchOpType::kDelete:
-            active_memtable_->Delete(operation.key, sequence);
+            status = active_memtable_->Delete(operation.key, sequence);
             break;
+        }
+        if (!status.ok()) {
+          return status;
         }
         if (sequence > manifest_->LastSequence()) {
           manifest_->SetLastSequence(sequence);
@@ -1026,7 +1289,7 @@ Status DB::FlushMemTable() {
     wal_->Close();
   }
   immutable_memtables_.push_back(ImmutableMemTable{active_memtable_, old_wal_number});
-  active_memtable_ = std::make_shared<MemTable>();
+  active_memtable_ = std::make_shared<MemTable>(vector_index_);
   active_wal_file_number_ = new_wal_number;
   active_memtable_oldest_wal_file_number_ = new_wal_number;
   wal_ = std::move(new_wal);
