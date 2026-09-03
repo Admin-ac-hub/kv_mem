@@ -43,11 +43,21 @@ if(BUILD_TESTING)
 
     add_test(NAME hnsw_test COMMAND hnsw_test)
     set_tests_properties(hnsw_test PROPERTIES TIMEOUT 60)
+
+    add_test(NAME week5_bench_sync_smoke
+        COMMAND week5_bench --mode sync --operations 10000 --threads 2 --batch-size 8)
+    set_tests_properties(week5_bench_sync_smoke PROPERTIES
+        LABELS benchmark
+        TIMEOUT 60)
 endif()
 
 add_executable(kv_bench bench/kv_bench.cpp)
 target_link_libraries(kv_bench PRIVATE kvdb)
 target_compile_options(kv_bench PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(week5_bench bench/week5_bench.cpp)
+target_link_libraries(week5_bench PRIVATE kvdb)
+target_compile_options(week5_bench PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(kv_stress stress/kv_stress.cpp)
 target_link_libraries(kv_stress PRIVATE kvdb)

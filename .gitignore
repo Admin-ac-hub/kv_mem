@@ -1,5 +1,6 @@
 build/
 /build-bench/
+/build-week5*/
 /cmake-build-*/
 /.VSCodeCounter/
 .idea/

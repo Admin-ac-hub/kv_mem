@@ -250,6 +250,10 @@ Benchmark 覆盖写入、顺序读、随机读、范围扫描和混合读写 wor
 
 workload 定义、指标解释和结果分析见 [docs/BENCHMARK_ANALYSIS.md](docs/BENCHMARK_ANALYSIS.md)。性能结果与硬件、文件系统、编译器和 OS page cache 强相关，比较时应固定 commit 和测试环境并进行多轮采样。
 
+第五周的同步、批处理和 Sanitizer 实验见
+[docs/WEEK5_PERFORMANCE_REPORT.md](docs/WEEK5_PERFORMANCE_REPORT.md)，可用
+`./scripts/run_week5_experiment.sh` 重现 CSV 数据。
+
 ## API 概览
 
 ```cpp
