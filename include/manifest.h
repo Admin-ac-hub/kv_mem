@@ -12,6 +12,7 @@ namespace kv {
 struct SSTableMeta {
   std::uint64_t file_number = 0;
   std::filesystem::path file_path;
+  std::filesystem::path index_path;
   int level = 0;
   std::string smallest_key;
   std::string largest_key;

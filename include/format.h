@@ -22,6 +22,7 @@ bool DecodeInternalKey(std::string_view internal_key,
                        SequenceNumber* sequence);
 
 std::string SSTableFileName(std::uint64_t number);
+std::string HNSWIndexFileName(std::uint64_t number);
 std::string WALFileName(std::uint64_t number);
 bool ParseSSTableFileName(const std::filesystem::path& path, std::uint64_t* number);
 bool ParseWALFileName(const std::filesystem::path& path, std::uint64_t* number);

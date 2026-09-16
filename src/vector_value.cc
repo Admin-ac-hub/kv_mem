@@ -7,6 +7,22 @@
 #include <limits>
 #include <utility>
 
+#if !defined(KV_DISABLE_SIMD) && (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__clang__) || defined(__GNUC__))
+#include <immintrin.h>
+#define KV_CAN_USE_AVX2_INTRINSICS 1
+#define KV_AVX2_TARGET __attribute__((target("avx2")))
+#else
+#define KV_CAN_USE_AVX2_INTRINSICS 0
+#endif
+
+#if !defined(KV_DISABLE_SIMD) && defined(__aarch64__)
+#include <arm_neon.h>
+#define KV_CAN_USE_NEON_INTRINSICS 1
+#else
+#define KV_CAN_USE_NEON_INTRINSICS 0
+#endif
+
 #include "format.h"
 
 namespace kv {
@@ -37,6 +53,168 @@ Status ValidateVector(const std::vector<float>& vector) {
     }
   }
   return Status::OK();
+}
+
+struct DistanceAccumulators {
+  double dot = 0.0;
+  double squared_l2 = 0.0;
+  double lhs_norm = 0.0;
+  double rhs_norm = 0.0;
+};
+
+DistanceAccumulators AccumulateScalar(const float* lhs,
+                                      const float* rhs,
+                                      size_t dimension,
+                                      VectorDistanceMetric metric) {
+  DistanceAccumulators values;
+  for (size_t i = 0; i < dimension; ++i) {
+    const double left = lhs[i];
+    const double right = rhs[i];
+    switch (metric) {
+      case VectorDistanceMetric::kL2: {
+        const double difference = left - right;
+        values.squared_l2 += difference * difference;
+        break;
+      }
+      case VectorDistanceMetric::kInnerProduct:
+        values.dot += left * right;
+        break;
+      case VectorDistanceMetric::kCosine:
+        values.dot += left * right;
+        values.lhs_norm += left * left;
+        values.rhs_norm += right * right;
+        break;
+    }
+  }
+  return values;
+}
+
+#if KV_CAN_USE_NEON_INTRINSICS
+// AArch64 provides NEON as part of its base ISA. Widen before multiplying to
+// retain the scalar path's range and avoid float accumulation error/overflow.
+template <VectorDistanceMetric metric>
+DistanceAccumulators AccumulateNEON(const float* lhs, const float* rhs,
+                                    size_t dimension) {
+  float64x2_t dot0 = vdupq_n_f64(0), dot1 = vdupq_n_f64(0);
+  float64x2_t left0 = vdupq_n_f64(0), left1 = vdupq_n_f64(0);
+  float64x2_t right0 = vdupq_n_f64(0), right1 = vdupq_n_f64(0);
+  size_t i = 0;
+  for (; i + 4 <= dimension; i += 4) {
+    const float32x4_t l = vld1q_f32(lhs + i), r = vld1q_f32(rhs + i);
+    const float64x2_t l0 = vcvt_f64_f32(vget_low_f32(l));
+    const float64x2_t l1 = vcvt_f64_f32(vget_high_f32(l));
+    const float64x2_t r0 = vcvt_f64_f32(vget_low_f32(r));
+    const float64x2_t r1 = vcvt_f64_f32(vget_high_f32(r));
+    if constexpr (metric == VectorDistanceMetric::kL2) {
+      const auto d0 = vsubq_f64(l0, r0), d1 = vsubq_f64(l1, r1);
+      dot0 = vaddq_f64(dot0, vmulq_f64(d0, d0));
+      dot1 = vaddq_f64(dot1, vmulq_f64(d1, d1));
+    } else {
+      dot0 = vaddq_f64(dot0, vmulq_f64(l0, r0));
+      dot1 = vaddq_f64(dot1, vmulq_f64(l1, r1));
+      if constexpr (metric == VectorDistanceMetric::kCosine) {
+        left0 = vaddq_f64(left0, vmulq_f64(l0, l0));
+        left1 = vaddq_f64(left1, vmulq_f64(l1, l1));
+        right0 = vaddq_f64(right0, vmulq_f64(r0, r0));
+        right1 = vaddq_f64(right1, vmulq_f64(r1, r1));
+      }
+    }
+  }
+  DistanceAccumulators values = AccumulateScalar(lhs + i, rhs + i, dimension - i, metric);
+  const double dot = vaddvq_f64(vaddq_f64(dot0, dot1));
+  if constexpr (metric == VectorDistanceMetric::kL2) {
+    values.squared_l2 += dot;
+  } else {
+    values.dot += dot;
+    if constexpr (metric == VectorDistanceMetric::kCosine) {
+      values.lhs_norm += vaddvq_f64(vaddq_f64(left0, left1));
+      values.rhs_norm += vaddvq_f64(vaddq_f64(right0, right1));
+    }
+  }
+  return values;
+}
+#endif
+
+#if KV_CAN_USE_AVX2_INTRINSICS
+KV_AVX2_TARGET DistanceAccumulators AccumulateAVX2(
+    const float* lhs,
+    const float* rhs,
+    size_t dimension,
+    VectorDistanceMetric metric) {
+  DistanceAccumulators values;
+  size_t i = 0;
+  alignas(32) float lanes[8];
+  for (; i + 8 <= dimension; i += 8) {
+    const __m256 left = _mm256_loadu_ps(lhs + i);
+    const __m256 right = _mm256_loadu_ps(rhs + i);
+    __m256 value;
+    switch (metric) {
+      case VectorDistanceMetric::kL2: {
+        const __m256 difference = _mm256_sub_ps(left, right);
+        value = _mm256_mul_ps(difference, difference);
+        _mm256_store_ps(lanes, value);
+        for (float lane : lanes) {
+          values.squared_l2 += static_cast<double>(lane);
+        }
+        break;
+      }
+      case VectorDistanceMetric::kInnerProduct:
+        value = _mm256_mul_ps(left, right);
+        _mm256_store_ps(lanes, value);
+        for (float lane : lanes) {
+          values.dot += static_cast<double>(lane);
+        }
+        break;
+      case VectorDistanceMetric::kCosine:
+        value = _mm256_mul_ps(left, right);
+        _mm256_store_ps(lanes, value);
+        for (float lane : lanes) {
+          values.dot += static_cast<double>(lane);
+        }
+        value = _mm256_mul_ps(left, left);
+        _mm256_store_ps(lanes, value);
+        for (float lane : lanes) {
+          values.lhs_norm += static_cast<double>(lane);
+        }
+        value = _mm256_mul_ps(right, right);
+        _mm256_store_ps(lanes, value);
+        for (float lane : lanes) {
+          values.rhs_norm += static_cast<double>(lane);
+        }
+        break;
+    }
+  }
+  const DistanceAccumulators tail =
+      AccumulateScalar(lhs + i, rhs + i, dimension - i, metric);
+  values.dot += tail.dot;
+  values.squared_l2 += tail.squared_l2;
+  values.lhs_norm += tail.lhs_norm;
+  values.rhs_norm += tail.rhs_norm;
+  return values;
+}
+
+bool RuntimeSupportsAVX2() {
+  return __builtin_cpu_supports("avx2");
+}
+#else
+bool RuntimeSupportsAVX2() {
+  return false;
+}
+#endif
+
+float FinalizeDistance(const DistanceAccumulators& values,
+                       VectorDistanceMetric metric) {
+  switch (metric) {
+    case VectorDistanceMetric::kL2:
+      return static_cast<float>(std::sqrt(values.squared_l2));
+    case VectorDistanceMetric::kInnerProduct:
+      return static_cast<float>(-values.dot);
+    case VectorDistanceMetric::kCosine:
+      return static_cast<float>(1.0 - std::clamp(
+          values.dot / std::sqrt(values.lhs_norm * values.rhs_norm),
+          -1.0, 1.0));
+  }
+  return std::numeric_limits<float>::quiet_NaN();
 }
 
 }  // namespace
@@ -148,46 +326,70 @@ Status ComputeVectorDistance(const std::vector<float>& lhs,
     return Status::InvalidArgument("vector dimensions do not match");
   }
 
-  double dot = 0.0;
-  double squared_l2 = 0.0;
-  double lhs_norm = 0.0;
-  double rhs_norm = 0.0;
-  for (size_t i = 0; i < lhs.size(); ++i) {
-    const double left = lhs[i];
-    const double right = rhs[i];
-    const double difference = left - right;
-    dot += left * right;
-    squared_l2 += difference * difference;
-    lhs_norm += left * left;
-    rhs_norm += right * right;
+  if (metric != VectorDistanceMetric::kL2 &&
+      metric != VectorDistanceMetric::kInnerProduct &&
+      metric != VectorDistanceMetric::kCosine) {
+    return Status::InvalidArgument("unknown vector distance metric");
+  }
+  if (metric == VectorDistanceMetric::kCosine) {
+    const auto has_nonzero = [](const std::vector<float>& vector) {
+      return std::any_of(vector.begin(), vector.end(),
+                         [](float value) { return value != 0.0f; });
+    };
+    if (!has_nonzero(lhs) || !has_nonzero(rhs)) {
+      return Status::InvalidArgument("cosine distance is undefined for a zero vector");
+    }
   }
 
-  double result = 0.0;
-  switch (metric) {
-    case VectorDistanceMetric::kL2:
-      result = std::sqrt(squared_l2);
-      break;
-    case VectorDistanceMetric::kInnerProduct:
-      result = -dot;
-      break;
-    case VectorDistanceMetric::kCosine:
-      if (lhs_norm == 0.0 || rhs_norm == 0.0) {
-        return Status::InvalidArgument("cosine distance is undefined for a zero vector");
-      }
-      result = 1.0 - std::clamp(dot / std::sqrt(lhs_norm * rhs_norm),
-                                -1.0, 1.0);
-      break;
-    default:
-      return Status::InvalidArgument("unknown vector distance metric");
-  }
+  const float result = ComputeVectorDistanceUnchecked(
+      lhs.data(), rhs.data(), lhs.size(), metric);
 
   if (!std::isfinite(result) ||
       result > std::numeric_limits<float>::max() ||
       result < -std::numeric_limits<float>::max()) {
     return Status::InvalidArgument("vector distance is outside float range");
   }
-  *distance = static_cast<float>(result);
+  *distance = result;
   return Status::OK();
+}
+
+float ComputeVectorDistanceUnchecked(const float* lhs,
+                                     const float* rhs,
+                                     size_t dimension,
+                                     VectorDistanceMetric metric) {
+#if KV_CAN_USE_NEON_INTRINSICS
+  switch (metric) {
+    case VectorDistanceMetric::kL2:
+      return FinalizeDistance(AccumulateNEON<VectorDistanceMetric::kL2>(
+          lhs, rhs, dimension), metric);
+    case VectorDistanceMetric::kInnerProduct:
+      return FinalizeDistance(AccumulateNEON<VectorDistanceMetric::kInnerProduct>(
+          lhs, rhs, dimension), metric);
+    case VectorDistanceMetric::kCosine:
+      return FinalizeDistance(AccumulateNEON<VectorDistanceMetric::kCosine>(
+          lhs, rhs, dimension), metric);
+  }
+#endif
+#if KV_CAN_USE_AVX2_INTRINSICS
+  if (RuntimeSupportsAVX2()) {
+    return FinalizeDistance(AccumulateAVX2(lhs, rhs, dimension, metric),
+                            metric);
+  }
+#endif
+  return FinalizeDistance(AccumulateScalar(lhs, rhs, dimension, metric),
+                          metric);
+}
+
+bool VectorDistanceUsesAVX2() {
+  return RuntimeSupportsAVX2();
+}
+
+const char* VectorDistanceBackend() {
+#if KV_CAN_USE_NEON_INTRINSICS
+  return "neon";
+#else
+  return RuntimeSupportsAVX2() ? "avx2" : "scalar";
+#endif
 }
 
 }  // namespace kv

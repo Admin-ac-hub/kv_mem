@@ -30,16 +30,17 @@
 - [x] 数据格式：向量 + JSON metadata（标签、时间戳、分类等）
 
 #### 2. HNSW 索引
-- [ ] 实现分层可导航小世界图（Hierarchical Navigable Small World）
-- [ ] 索引构建：增量构建，支持并发插入
-- [ ] 索引持久化：SSTable 同步刷写索引文件
-- [ ] 参数可调：`M`（每层最大边数）、`ef_construction`（构建时搜索宽度）
-- [ ] 内存管理：索引常驻内存或 mmap
+- [x] 实现分层可导航小世界图（Hierarchical Navigable Small World）
+- [x] 索引构建：增量构建；调用可并发，实际插入由独占锁串行执行
+- [ ] 真正并行的索引插入或延迟索引构建
+- [x] 索引持久化：SSTable 同步刷写索引文件
+- [x] 参数可调：`M`（上层度数上限；底层上限为 2M）、`ef_construction`（构建时搜索宽度）
+- [x] 内存管理：索引常驻内存
 
 #### 3. ANN 搜索
-- [ ] TopK 查询：返回最近的 K 个向量
-- [ ] 查询参数：`ef_search`（搜索时的动态列表大小）
-- [ ] 结果返回：`(key, distance, metadata)` 列表
+- [x] TopK 查询：返回最近的 K 个向量
+- [x] 查询参数：`ef_search`（搜索时的动态列表大小）
+- [x] 结果返回：`(key, distance, metadata)` 列表
 - [ ] 性能目标：100 万向量，P99 延迟 < 10ms，Recall@10 > 0.95
 
 #### 4. 混合检索
@@ -48,28 +49,32 @@
 - [ ] 分数融合：支持标量相关性 + 向量相似度的加权排序
 
 #### 5. 索引与 Compaction 协调
-- [ ] Compaction 时增量重建索引（只处理变化的部分）
-- [ ] 多版本索引管理：Compaction 期间查询使用旧索引，完成后原子切换
-- [ ] 删除处理：tombstone 在索引中标记为不可见
+- [x] Compaction 时全量构建替换索引（增量更新策略留作后续优化）
+- [x] 多版本索引管理：Compaction 期间查询使用旧索引，完成后原子切换
+- [x] 删除处理：tombstone 在索引中标记为不可见
 
 #### 6. 性能优化
-- [ ] SIMD 加速距离计算（AVX2 / AVX-512）
-- [ ] 批量查询优化：一次查询多个向量，复用索引遍历
-- [ ] 预取优化：减少随机访问导致的 cache miss
+- [x] SIMD 加速距离计算（x86 AVX2 运行时探测、AArch64 NEON、标量回退）
+- [x] 批量查询优化：一次查询多个向量，复用 HNSW 读锁
+- [x] 连续向量布局与 thread-local 搜索标记，减少分配和 cache miss
 
 ### 可观测性（必须实现）
 
-- [ ] 索引统计：节点数、边数、层数分布
+- [x] 索引统计：`DB::VectorIndexStats()` 暴露节点数、边数、层数分布和各层最大度数
 - [ ] 查询指标：QPS、P50/P99 延迟、Recall
 - [ ] 插入指标：吞吐、索引构建耗时
 - [ ] 存储指标：SSTable 大小、索引文件大小、内存占用
 
 ### Benchmark（必须实现）
 
-- [ ] 写入 Benchmark：顺序插入 100 万向量，测吞吐
-- [ ] 查询 Benchmark：随机查询 1000 次，测延迟分布和 Recall
-- [ ] 混合 Benchmark：50% 写 + 50% 读
-- [ ] 对比基线：纯暴力搜索（验证 Recall）、纯内存 HNSW（验证开销）
+- [x] 写入 Benchmark 程序：可配置 100 万向量；正式规模尚未执行
+- [x] 查询 Benchmark 程序：可配置 1000 次查询；正式规模尚未执行
+- [x] 混合 Benchmark 程序：交替执行 50% 写 + 50% 读
+- [x] 对比基线：纯暴力搜索验证 Recall
+- [ ] 100 万 × 768 正式验收，保留硬件、构建配置、原始日志和重复运行结果
+
+勾选“程序已实现”不代表性能达标。当前结果及限制见
+`docs/WEEK6_BENCHMARK_REPORT.md`；目标值不能填入简历实测指标。
 
 ### 延后/不做的功能（简历可提但不实现）
 
@@ -165,16 +170,23 @@ class HNSWIndex {
 索引文件格式：index_XXXXXX.hnsw
 
 Header:
-  [magic(4)] + [version(4)] + [M(4)] + [ef_construction(4)] + [max_layer(4)] + [num_nodes(8)]
+  [magic(8)] + [version(4)] + [dimension(4)] + [M(4)] + [ef_construction(4)]
+  + [metric(4)] + [max_layer(4)] + [num_nodes(8)] + [num_versions(8)]
+  + [entry_point(8)]
 
 NodeSection:
   For each node:
-    [internal_id(8)] + [user_key_len(4)] + [user_key(var)] + [dim(4)] + [vector(dim*4)]
+    [internal_id(8)] + [user_key_len(4)] + [user_key(var)] + [sequence(8)]
+    + [vector(dim*4)] + [metadata_len(4)] + [metadata(var)]
     + [num_layers(4)]
     + For each layer: [num_neighbors(4)] + [neighbor_ids(num_neighbors*8)]
 
+VersionSection:
+  For each version: [key_len(4)] + [key(var)] + [sequence(8)] + [node_id(8)]
+  + [deleted(1)]
+
 Footer:
-  [entry_point(8)] + [checksum(4)]
+  [checksum(4)]  // CRC32 of NodeSection + VersionSection
 ```
 
 ### LSM 与索引的集成
@@ -285,7 +297,9 @@ HNSW.Search() -> 候选 key 列表
 - [x] 1000 个 128 维向量，Recall@10 > 0.90
 - [x] 搜索延迟 < 1ms
 
-验收由 `hnsw_test` 使用固定随机种子执行，并以暴力搜索结果计算 Recall。
+上述为小规模回归，不能替代产品规模验收。`hnsw_test` 使用固定随机种子和
+暴力搜索基线；`KV_ENABLE_RECALL_REGRESSION=ON` 额外启用 20k × 128/768
+的慢速 Recall 回归（100 个查询，明确使用 M=32、ef=512；不代表默认参数达标）。
 
 **参考资料**：
 - 论文：Malkov & Yashunin (2016) "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs"
@@ -305,8 +319,8 @@ HNSW.Search() -> 候选 key 列表
 - [x] 集成测试：并发写入 + 查询，验证正确性
 
 **验收标准**：
-- 10 万向量，插入吞吐 > 1 万/s（benchmark 入口待补充）
-- 查询 QPS > 5000，Recall@10 > 0.95（HNSW acceptance 基线）
+- [ ] 10 万向量，插入吞吐 > 1 万/s（未验收）
+- [ ] 查询 QPS > 5000，Recall@10 > 0.95（未验收）
 
 ---
 
@@ -315,36 +329,34 @@ HNSW.Search() -> 候选 key 列表
 **目标**：索引能随 SSTable Flush 持久化，重启后恢复
 
 **任务**：
-- [ ] 设计索引文件格式（见上文）
-- [ ] 实现 `HNSWIndex::Save(filename)` 和 `Load(filename)`
-- [ ] 修改 Flush 逻辑：生成 SSTable 时同步生成索引文件
-- [ ] 修改 Manifest：记录索引文件路径
-- [ ] 修改恢复逻辑：重启时加载所有索引文件，合并成全局索引
-- [ ] 测试：插入 -> Flush -> 重启 -> 验证查询结果一致
+- [x] 设计索引文件格式（见上文）
+- [x] 实现 `HNSWIndex::Save(filename)` 和 `Load(filename)`
+- [x] 修改 Flush 逻辑：生成 SSTable 时同步生成索引文件
+- [x] 修改 Manifest：记录索引文件路径
+- [x] 修改恢复逻辑：重启时加载所有索引文件，合并成全局索引
+- [x] 测试：插入 -> Flush -> 重启 -> 验证查询结果一致
 
 **验收标准**：
-- 重启后查询结果与重启前完全一致
-- 索引文件大小合理（< 向量数据的 2 倍）
+- [x] 重启后查询结果与重启前完全一致
+- [x] 索引文件大小合理（< 向量数据的 2 倍）
 
 ---
 
 ### Week 5: Compaction 与索引重建
 
-**目标**：Compaction 时增量重建索引，保持查询可用
+**目标**：Compaction 时重建索引，保持查询可用
 
 **任务**：
-- [ ] 设计增量索引重建策略：
-  - 方案 A：重建整个索引（简单但慢）
-  - 方案 B：只更新变化的节点（复杂但快）→ 先实现方案 A
-- [ ] 修改 Compaction 逻辑：归并 SSTable 时同步重建索引
-- [ ] 实现索引版本管理：Compaction 期间查询使用旧索引
-- [ ] 实现原子切换：Compaction 完成后切换到新索引
-- [ ] 测试：大量写入 -> 触发 Compaction -> 验证查询不中断
+- [x] 设计索引重建策略并实现方案 A：重建整个索引；方案 B 增量更新留作优化
+- [x] 修改 Compaction 逻辑：归并 SSTable 时同步重建索引
+- [x] 实现索引版本管理：耗时构建阶段不持有 `version_mu_`，查询继续使用旧索引
+- [x] 实现原子切换：发布前补入并发 Flush/MemTable 版本，再切换到新索引
+- [x] 测试：构建期间并发写入和查询，验证查询不中断且新写入不丢失
 
 **验收标准**：
-- Compaction 期间查询不返回错误
-- Compaction 后 Recall 不下降
-- 旧版本向量被正确清理
+- [x] Compaction 构建期间查询可在旧索引完成，不被全局版本锁阻塞
+- [x] 固定数据集 Compaction 后 Recall@10 不下降且不低于 0.95
+- [x] 覆盖写和 tombstone 对应的旧向量节点从输出索引清理
 
 ---
 
@@ -353,19 +365,25 @@ HNSW.Search() -> 候选 key 列表
 **目标**：优化性能，达到可展示的指标
 
 **任务**：
-- [ ] SIMD 优化距离计算（AVX2）
-- [ ] 批量查询优化（一次查询多个向量）
-- [ ] 内存布局优化（减少 cache miss）
-- [ ] 实现完整 Benchmark 套件：
-  - 写入 Benchmark：100 万向量，测吞吐
-  - 查询 Benchmark：1000 次随机查询，测延迟和 Recall
-  - 混合 Benchmark：50% 写 + 50% 读
-- [ ] 生成 Benchmark 报告（见下文模板）
+- [x] SIMD 优化距离计算（AVX2，运行时探测）
+- [x] 批量查询优化（一次查询多个向量）
+- [x] 内存布局优化（连续向量数据和 thread-local 搜索标记）
+- [x] 实现完整 Benchmark 套件：
+  - [x] 写入 Benchmark 程序，支持配置 100 万向量
+  - [x] 查询 Benchmark 程序，支持配置 1000 次查询和精确 Recall 抽样
+  - [x] 混合 Benchmark：50% 写 + 50% 读
+- [x] 生成 Benchmark 报告：`docs/WEEK6_BENCHMARK_REPORT.md`
 
-**验收标准**（目标指标）：
-- **写入**：吞吐 > 5 万/s（768 维）
-- **查询**：QPS > 1 万，P99 < 10ms，Recall@10 > 0.95
-- **混合**：写入吞吐 > 2 万/s，查询 QPS > 5000
+**验收标准**（目标指标，均未通过正式验收）：
+- [ ] 100 万 × 768 完整运行并保存原始结果
+- [ ] **写入**：吞吐 > 5 万/s（768 维，包含后台 flush/compaction 收尾）
+- [ ] **查询**：QPS > 1 万，单请求 P99 < 10ms，Recall@10 > 0.95
+- [ ] **混合**：按同一 wall-clock 窗口统计写入吞吐 > 2 万/s、查询 QPS > 5000
+
+每 batch 一次 fsync 并不在数学上排除高吞吐：同步开销受 batch 大小和设备延迟
+影响。当前已测瓶颈是串行 HNSW 构建；group commit 也不能单独消除这一瓶颈。
+批量耗时除以 batch 大小是摊销耗时，不可作为单请求 P99。AVX2 路径的性能需在
+支持 AVX2 的 x86 主机上验证；arm64 结果必须注明实际距离计算后端。
 
 ---
 
@@ -468,6 +486,9 @@ HNSW.Search() -> 候选 key 列表
 
 ## API 设计
 
+以下是目标接口草案，含尚未实现的混合检索；当前可调用接口以 `include/db.h` 为准。
+示例的指定字段初始化是伪代码，不是当前 C++17 API 的编译示例。
+
 ```cpp
 class VectorDB {
 public:
@@ -529,32 +550,35 @@ public:
 
 ## 简历描述模板
 
+只描述已实现、已验证的能力。下列性能项需要填入同一次实测的规模、参数、硬件
+与结果；百万规模尚未验收，不得用目标值替换占位项。
+
 ### 项目名称
 **基于 LSM-Tree 的轻量级向量数据库**
 
 ### 技术栈
-C++17 / LSM-Tree / HNSW / SIMD / Protobuf / CMake
+C++17 / LSM-Tree / HNSW / SIMD / CMake
 
 ### 项目描述
-在现有 LSM-KV 存储引擎基础上实现向量存储和近似最近邻（ANN）搜索，支持高吞吐写入、混合检索和崩溃恢复。适用于语义搜索、推荐系统和 RAG 应用。
+在现有 LSM-KV 存储引擎基础上实现向量存储和近似最近邻（ANN）搜索，支持批量写入、MVCC 查询和崩溃恢复。混合检索尚未实现。
 
 ### 核心功能
 - 实现 HNSW（Hierarchical Navigable Small World）索引，支持高效的 ANN 搜索
-- 设计向量与标量数据的混合存储格式，支持 Compaction 时的增量索引重建
-- 实现查询优化：Bloom Filter 预过滤、SIMD 加速距离计算、批量查询复用
+- 设计向量与标量数据的混合存储格式，支持 Compaction 时的全量替换索引重建
+- 实现 KV 点查 Bloom Filter、向量 SIMD 距离计算和批量查询读锁复用
 - 支持 MVCC Snapshot 隔离和 tombstone 可见性控制
 - 完整的 WAL + Manifest 崩溃恢复机制
 
 ### 性能指标
-- 写入：100 万 768 维向量，吞吐 XX 万/s
-- 查询：QPS XX 万，P99 延迟 < 10ms，Recall@10 > 0.95
-- 存储：索引文件大小 < 向量数据 2 倍，内存占用 XX MB
+- 写入：实测规模、维度、batch、包含后台收尾的吞吐（待填）
+- 查询：实测 M/ef、查询并发、QPS、单请求 P99、精确基线 Recall@10（待填）
+- 存储：同次运行的 SSTable/索引字节与峰值内存（待填）
 
 ### 技术难点
 1. **索引一致性**：Compaction 期间保持查询可用，通过多版本索引管理和原子切换解决
-2. **并发控制**：分离 write / memtable / version / background 四把锁，读取 I/O 不占用全局锁
-3. **性能优化**：AVX2 SIMD 加速距离计算，向量内存对齐减少 cache miss
-4. **混合检索**：支持标量过滤 + 向量相似度的组合查询，实现多条件排序
+2. **并发控制**：分离 write / memtable / version / compaction / background 锁，耗时构建和读取 I/O 不占用全局版本锁
+3. **性能优化**：AVX2 / NEON 距离计算、连续向量布局及线程局部访问标记
+4. **测试验证**：多规模 Recall、索引文件结构校验和并发 Flush/Compaction 版本可见性回归
 
 ---
 
@@ -621,7 +645,7 @@ Q: 向量数据如何编码？为什么这样设计？
 A: [type(1) + dim(4) + vector(dim*4) + metadata]，定长头 + 变长尾，方便解码和跳过
 
 Q: Compaction 时如何处理向量？
-A: 流式归并，只保留最新版本，tombstone 不写入新 SSTable
+A: 流式归并并重建索引；保留活跃 snapshot 需要的版本，tombstone 只在最底层确认安全后丢弃
 
 Q: 向量数据量很大，如何优化存储空间？
 A: 可以用量化（PQ）或压缩（Zstd），当前版本未实现但保留了扩展点
@@ -641,13 +665,13 @@ A: 标记为 deleted，查询时跳过，Compaction 时真正删除
 
 ### 系统层
 Q: 并发插入时，索引如何保证一致性？
-A: 每层单独加读写锁，插入只锁涉及的层，查询用读锁
+A: 当前图使用一把 `shared_mutex`，插入持独占锁，查询持共享锁；分层细粒度锁尚未实现
 
 Q: Compaction 期间查询会中断吗？
-A: 不会，Compaction 生成新索引，完成后原子切换，旧索引引用计数为 0 时删除
+A: 耗时构建阶段继续查询旧索引，发布时短暂取得索引独占锁并替换图状态
 
 Q: 如果索引文件损坏怎么办？
-A: 索引有 checksum，加载时校验，失败则从 SSTable 重建
+A: 索引有 checksum，加载失败返回 `Corruption`；仅旧格式 Manifest 未记录索引时自动扫描 SSTable 重建
 
 Q: 内存占用如何控制？
 A: 索引常驻内存（当前设计），如果太大可以 mmap 或只缓存热点层

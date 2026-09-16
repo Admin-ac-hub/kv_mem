@@ -81,11 +81,36 @@ bool WaitForCompactionCount(kv::DB* db, std::uint64_t count) {
   return false;
 }
 
+bool WaitForLevel2SSTable(kv::DB* db) {
+  for (int i = 0; i < 200; ++i) {
+    if (db->Stats().level2_sstable_count > 0) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
 std::vector<std::filesystem::path> ListSSTables(const std::filesystem::path& db_path) {
   std::vector<std::filesystem::path> files;
   for (const auto& entry : std::filesystem::directory_iterator(db_path)) {
     std::uint64_t number = 0;
     if (entry.is_regular_file() && kv::ParseSSTableFileName(entry.path(), &number)) {
+      files.push_back(entry.path());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  return files;
+}
+
+std::vector<std::filesystem::path> ListHNSWIndexes(
+    const std::filesystem::path& db_path) {
+  std::vector<std::filesystem::path> files;
+  if (!std::filesystem::exists(db_path)) {
+    return files;
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(db_path)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".hnsw") {
       files.push_back(entry.path());
     }
   }
@@ -483,6 +508,14 @@ void TestVectorWriteBatchWALAndDBLifecycle() {
     CHECK(results[0].key == "vector:a");
     MustOK(db.Compact());
     MustOK(db.Close());
+
+    kv::Manifest manifest(db_path);
+    MustOK(manifest.Load());
+    CHECK(!manifest.SSTables().empty());
+    for (const auto& meta : manifest.SSTables()) {
+      CHECK(!meta.index_path.empty());
+      CHECK(std::filesystem::exists(meta.index_path));
+    }
   }
 
   {
@@ -546,6 +579,18 @@ void TestVectorBruteForceSearchAcceptance() {
       }
     }
     MustOK(db.Close());
+
+    const auto index_files = ListHNSWIndexes(db_path);
+    CHECK(index_files.size() == 1);
+    std::uintmax_t index_size = 0;
+    for (const auto& index_file : index_files) {
+      index_size += std::filesystem::file_size(index_file);
+    }
+    const std::uintmax_t raw_vector_bytes =
+        1000ULL * 768ULL * sizeof(float);
+    std::cout << "Vector persistence acceptance: index_bytes=" << index_size
+              << ", raw_vector_bytes=" << raw_vector_bytes << '\n';
+    CHECK(index_size < raw_vector_bytes * 2);
   }
 
   {
@@ -567,6 +612,12 @@ void TestHNSWLSMIntegrationAndMVCC() {
   const std::filesystem::path db_path = TestDBPath("test_db_hnsw_lsm");
   std::filesystem::remove_all(db_path);
 
+  std::mutex compaction_test_mu;
+  std::condition_variable compaction_test_cv;
+  bool compaction_ready_to_publish = false;
+  bool allow_compaction_publish = false;
+  bool search_completed_during_build = false;
+
   kv::Options options;
   options.db_path = db_path;
   options.vector_dimension = 3;
@@ -574,6 +625,12 @@ void TestHNSWLSMIntegrationAndMVCC() {
   options.hnsw_ef_construction = 64;
   options.memtable_entries_limit = 3;
   options.level0_sstable_limit = 100;
+  options.testing_before_compaction_publish = [&] {
+    std::unique_lock<std::mutex> lock(compaction_test_mu);
+    compaction_ready_to_publish = true;
+    compaction_test_cv.notify_all();
+    compaction_test_cv.wait(lock, [&] { return allow_compaction_publish; });
+  };
 
   {
     kv::DB db(options);
@@ -587,6 +644,15 @@ void TestHNSWLSMIntegrationAndMVCC() {
                      kv::ReadOptions{}));
     CHECK(results.size() == 2);
     CHECK(results[0].key == "a");
+
+    std::vector<std::vector<kv::VectorResult>> batch_results;
+    MustOK(db.SearchBatch({{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}}, 2,
+                          32, &batch_results));
+    CHECK(batch_results.size() == 2);
+    CHECK(batch_results[0].size() == 2);
+    CHECK(batch_results[0][0].key == "a");
+    CHECK(batch_results[1].size() == 2);
+    CHECK(batch_results[1][0].key == "b");
 
     const kv::Snapshot* snapshot = db.GetSnapshot();
     MustOK(db.PutVector("a", {0.0f, 0.0f, 2.0f}, "{\"v\":2}"));
@@ -611,9 +677,76 @@ void TestHNSWLSMIntegrationAndMVCC() {
       found_b = found_b || result.key == "b";
     }
     CHECK(found_b);
+    MustOK(db.SearchBatch({{1.0f, 0.0f, 0.0f}}, 2, 32, &batch_results,
+                          snapshot_read));
+    CHECK(batch_results.size() == 1);
+    CHECK(batch_results[0].size() == 2);
+    CHECK(batch_results[0][0].key == "a");
     db.ReleaseSnapshot(snapshot);
 
-    MustOK(db.Compact());
+    CHECK(WaitForSSTableCount(&db, 1));
+    const auto old_indexes = ListHNSWIndexes(db_path);
+    CHECK(!old_indexes.empty());
+
+    kv::Status compaction_status;
+    std::thread compactor([&] { compaction_status = db.Compact(); });
+    {
+      std::unique_lock<std::mutex> lock(compaction_test_mu);
+      CHECK(compaction_test_cv.wait_for(
+          lock, std::chrono::seconds(2),
+          [&] { return compaction_ready_to_publish; }));
+    }
+
+    MustOK(db.PutVector("during-compaction", {9.0f, 9.0f, 9.0f},
+                        "{\"v\":3}"));
+    kv::Status concurrent_search_status;
+    std::vector<kv::VectorResult> concurrent_results;
+    std::thread reader([&] {
+      concurrent_search_status =
+          db.Search({9.0f, 9.0f, 9.0f}, 1, 32, &concurrent_results);
+      {
+        std::lock_guard<std::mutex> lock(compaction_test_mu);
+        search_completed_during_build = true;
+      }
+      compaction_test_cv.notify_all();
+    });
+
+    bool search_was_nonblocking = false;
+    {
+      std::unique_lock<std::mutex> lock(compaction_test_mu);
+      search_was_nonblocking = compaction_test_cv.wait_for(
+          lock, std::chrono::seconds(2),
+          [&] { return search_completed_during_build; });
+      allow_compaction_publish = true;
+    }
+    compaction_test_cv.notify_all();
+    reader.join();
+    compactor.join();
+    CHECK(search_was_nonblocking);
+    MustOK(concurrent_search_status);
+    CHECK(concurrent_results.size() == 1);
+    CHECK(concurrent_results[0].key == "during-compaction");
+    MustOK(compaction_status);
+
+    MustOK(db.Search({9.0f, 9.0f, 9.0f}, 1, 32, &concurrent_results));
+    CHECK(concurrent_results.size() == 1);
+    CHECK(concurrent_results[0].key == "during-compaction");
+
+    const auto new_indexes = ListHNSWIndexes(db_path);
+    CHECK(!new_indexes.empty());
+    for (const auto& old_index : old_indexes) {
+      CHECK(!std::filesystem::exists(old_index));
+    }
+
+    MustOK(db.PutVector("after-compaction", {1.0f, 0.0f, 0.0f},
+                        "{\"v\":3}"));
+    MustOK(db.Search({1.0f, 0.0f, 0.0f}, 10, 32, &results));
+    bool found_after_compaction = false;
+    for (const auto& result : results) {
+      found_after_compaction =
+          found_after_compaction || result.key == "after-compaction";
+    }
+    CHECK(found_after_compaction);
     MustOK(db.Close());
   }
 
@@ -623,12 +756,101 @@ void TestHNSWLSMIntegrationAndMVCC() {
     std::vector<kv::VectorResult> results;
     MustOK(db.Search({1.0f, 0.0f, 0.0f}, 3, 32, &results));
     CHECK(!results.empty());
-    CHECK(results[0].key == "c");
+    CHECK(results[0].key == "after-compaction");
+    bool found_c = false;
     for (const auto& result : results) {
       CHECK(result.key != "b");
+      found_c = found_c || result.key == "c";
     }
+    CHECK(found_c);
   }
 
+  std::filesystem::remove_all(db_path);
+}
+
+void TestHNSWCompactionRecallAndVersionCleanup() {
+  const std::filesystem::path db_path =
+      TestDBPath("test_db_hnsw_compaction_recall");
+  std::filesystem::remove_all(db_path);
+
+  constexpr size_t kDimension = 8;
+  auto make_vector = [](size_t id, size_t generation) {
+    std::vector<float> vector(kDimension);
+    for (size_t dimension = 0; dimension < kDimension; ++dimension) {
+      vector[dimension] = static_cast<float>(
+          std::sin((id + 1) * (dimension + 1) * 0.17 + generation * 0.11));
+    }
+    return vector;
+  };
+
+  kv::Options options;
+  options.db_path = db_path;
+  options.vector_dimension = kDimension;
+  options.hnsw_max_neighbors = 16;
+  options.hnsw_ef_construction = 128;
+  options.memtable_entries_limit = 50;
+  options.level0_sstable_limit = 100;
+
+  kv::DB db(options);
+  MustOK(db.Open());
+  std::vector<std::vector<float>> live_vectors(160);
+  for (size_t id = 0; id < 100; ++id) {
+    live_vectors[id] = make_vector(id, 0);
+    MustOK(db.PutVector("recall:" + std::to_string(id), live_vectors[id]));
+  }
+  for (size_t id = 0; id < 20; ++id) {
+    live_vectors[id] = make_vector(id, 1);
+    MustOK(db.PutVector("recall:" + std::to_string(id), live_vectors[id]));
+  }
+  for (size_t id = 20; id < 40; ++id) {
+    MustOK(db.Delete("recall:" + std::to_string(id)));
+  }
+  for (size_t id = 100; id < 160; ++id) {
+    live_vectors[id] = make_vector(id, 0);
+    MustOK(db.PutVector("recall:" + std::to_string(id), live_vectors[id]));
+  }
+  CHECK(WaitForSSTableCount(&db, 4));
+
+  const std::vector<size_t> query_ids = {0, 7, 19, 40, 75, 100, 127, 159};
+  auto measure_recall = [&] {
+    size_t hits = 0;
+    size_t expected = 0;
+    for (size_t query_id : query_ids) {
+      std::vector<kv::VectorResult> exact;
+      std::vector<kv::VectorResult> approximate;
+      MustOK(db.BruteForceSearch(live_vectors[query_id], 10, &exact));
+      MustOK(db.Search(live_vectors[query_id], 10, 256, &approximate));
+      expected += exact.size();
+      for (const auto& result : exact) {
+        hits += std::any_of(
+            approximate.begin(), approximate.end(),
+            [&](const kv::VectorResult& candidate) {
+              return candidate.key == result.key;
+            });
+      }
+    }
+    return expected == 0
+               ? 1.0
+               : static_cast<double>(hits) / static_cast<double>(expected);
+  };
+
+  const double recall_before = measure_recall();
+  MustOK(db.Compact());
+  const double recall_after = measure_recall();
+  CHECK(recall_after >= 0.95);
+  CHECK(recall_after + 1e-12 >= recall_before);
+
+  const auto indexes = ListHNSWIndexes(db_path);
+  CHECK(indexes.size() == 1);
+  kv::HNSWOptions index_options;
+  index_options.dimension = kDimension;
+  index_options.max_neighbors = options.hnsw_max_neighbors;
+  index_options.ef_construction = options.hnsw_ef_construction;
+  kv::HNSWIndex compacted_index(index_options);
+  MustOK(compacted_index.Load(indexes.front()));
+  CHECK(compacted_index.Size() == 140);
+
+  MustOK(db.Close());
   std::filesystem::remove_all(db_path);
 }
 
@@ -1249,6 +1471,7 @@ void TestLeveledCompactionL1ToL2AndTombstones() {
   kv::Options options;
   options.db_path = db_path;
   options.level0_sstable_limit = 1;
+  options.level1_size_limit_bytes = 64 * 1024;
   kv::DB db(options);
   MustOK(db.Open());
 
@@ -1262,7 +1485,7 @@ void TestLeveledCompactionL1ToL2AndTombstones() {
 
   FillToFlush(&db, "round3", "v");
   FillToFlush(&db, "round4", "v");
-  CHECK(WaitForCompactionCount(&db, 2));
+  CHECK(WaitForLevel2SSTable(&db));
 
   kv::DBStats stats = db.Stats();
   CHECK(stats.level2_sstable_count >= 1);
@@ -1282,6 +1505,109 @@ void TestLeveledCompactionL1ToL2AndTombstones() {
   }
 
   std::filesystem::remove_all(db_path);
+}
+
+void TestGetUsesSequenceAcrossConcurrentCompactionAndFlush() {
+  const auto path = TestDBPath("compaction_flush_sequence_order");
+  std::filesystem::remove_all(path);
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool ready = false;
+  bool publish = false;
+  kv::Options options;
+  options.db_path = path;
+  options.memtable_entries_limit = 3;
+  options.level0_sstable_limit = 100;
+  options.testing_before_compaction_publish = [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    ready = true;
+    cv.notify_all();
+    cv.wait(lock, [&] { return publish; });
+  };
+  kv::DB db(options);
+  MustOK(db.Open());
+  kv::WriteBatch old;
+  old.Delete("resurrected");
+  old.Put("updated", "old");
+  old.Put("removed", "old");
+  MustOK(db.Write(old));
+  CHECK(WaitForSSTableCount(&db, 1));
+  const auto* snapshot = db.GetSnapshot();
+  kv::Status compact_status;
+  std::thread compactor([&] { compact_status = db.Compact(); });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    CHECK(cv.wait_for(lock, std::chrono::seconds(2), [&] { return ready; }));
+  }
+  kv::WriteBatch newer;
+  newer.Put("resurrected", "new");
+  newer.Put("updated", "new");
+  newer.Delete("removed");
+  MustOK(db.Write(newer));
+  CHECK(WaitForSSTableCount(&db, 2));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    publish = true;
+  }
+  cv.notify_all();
+  compactor.join();
+  MustOK(compact_status);
+  const auto verify_latest = [&] {
+    std::string value;
+    MustOK(db.Get("resurrected", &value));
+    CHECK(value == "new");
+    MustOK(db.Get("updated", &value));
+    CHECK(value == "new");
+    CHECK(db.Get("removed", &value).IsNotFound());
+  };
+  verify_latest();
+  std::string value;
+  CHECK(db.Get("resurrected", &value, {snapshot}).IsNotFound());
+  MustOK(db.Get("updated", &value, {snapshot}));
+  CHECK(value == "old");
+  MustOK(db.Get("removed", &value, {snapshot}));
+  CHECK(value == "old");
+  db.ReleaseSnapshot(snapshot);
+  MustOK(db.Close());
+  MustOK(db.Open());
+  verify_latest();
+  MustOK(db.Close());
+  std::filesystem::remove_all(path);
+}
+
+void TestVectorCompactionByteBudget() {
+  for (const bool small_budget : {false, true}) {
+    const auto path = TestDBPath(small_budget ? "vector_small_l1" : "vector_default_l1");
+    std::filesystem::remove_all(path);
+    kv::Options options;
+    options.db_path = path;
+    options.vector_dimension = 768;
+    options.memtable_entries_limit = 2;
+    options.level0_sstable_limit = 1;
+    if (small_budget) {
+      options.level1_size_limit_bytes = 1024;
+    }
+    kv::DB db(options);
+    MustOK(db.Open());
+    for (size_t i = 0; i < 4; ++i) {
+      MustOK(db.PutVector(Key(i), std::vector<float>(768, static_cast<float>(i))));
+    }
+    // Close joins the worker after it drains flushes and automatic compactions.
+    MustOK(db.Close());
+    const auto stats = db.Stats();
+    CHECK(stats.flush_count == 2);
+    CHECK(db.VectorIndexStats().node_count == 4);
+    CHECK(stats.level0_sstable_count == 0);
+    CHECK(stats.level1_sstable_count == (small_budget ? 0 : 1));
+    CHECK(stats.level2_sstable_count == (small_budget ? 1 : 0));
+    CHECK(stats.compaction_count == (small_budget ? 2 : 1));
+    MustOK(db.Open());
+    kv::VectorRecord record;
+    MustOK(db.GetVector(Key(3), &record));
+    CHECK(record.vector == std::vector<float>(768, 3.0f));
+    MustOK(db.Close());
+    std::filesystem::remove_all(path);
+  }
 }
 
 void TestCompactionUsesStreamingIterators() {
@@ -1864,6 +2190,7 @@ int main() {
   TestVectorWriteBatchWALAndDBLifecycle();
   TestVectorBruteForceSearchAcceptance();
   TestHNSWLSMIntegrationAndMVCC();
+  TestHNSWCompactionRecallAndVersionCleanup();
   TestConcurrentHNSWSearchAndWrites();
   TestTruncatedLastWALBatchIsIgnored();
   TestImmutableMemTableWriteAndReadOrdering();
@@ -1883,6 +2210,8 @@ int main() {
   TestAutomaticCompaction();
   TestLeveledCompactionL0ToL1();
   TestLeveledCompactionL1ToL2AndTombstones();
+  TestVectorCompactionByteBudget();
+  TestGetUsesSequenceAcrossConcurrentCompactionAndFlush();
   TestCompactionUsesStreamingIterators();
   TestSnapshotReadStability();
   TestSnapshotAcrossFlushAndCompaction();

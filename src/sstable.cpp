@@ -620,7 +620,8 @@ Status SSTable::Open(std::uint64_t file_number,
 
 Status SSTable::Get(const std::string& key,
                     SequenceNumber read_sequence,
-                    std::optional<std::string>* value) const {
+                    std::optional<std::string>* value,
+                    SequenceNumber* matched_sequence) const {
   value->reset();
   if (!filter_.MayContain(key)) {
     bloom_filtered_count_.fetch_add(1, std::memory_order_relaxed);
@@ -637,7 +638,8 @@ Status SSTable::Get(const std::string& key,
   }
 
   bool found = false;
-  Status status = GetFromBlock(*it, key, read_sequence, value, &found);
+  Status status = GetFromBlock(*it, key, read_sequence, value, &found,
+                               matched_sequence);
   if (!status.ok()) {
     return status;
   }
@@ -650,9 +652,10 @@ Status SSTable::Get(const std::string& key,
 Status SSTable::Get(const std::string& key,
                     SequenceNumber read_sequence,
                     std::string* value,
-                    bool* found) const {
+                    bool* found,
+                    SequenceNumber* matched_sequence) const {
   std::optional<std::string> maybe_value;
-  Status status = Get(key, read_sequence, &maybe_value);
+  Status status = Get(key, read_sequence, &maybe_value, matched_sequence);
   if (!status.ok()) {
     *found = false;
     return status;
@@ -825,7 +828,8 @@ Status SSTable::GetFromBlock(const IndexEntry& index,
                              const std::string& key,
                              SequenceNumber read_sequence,
                              std::optional<std::string>* value,
-                             bool* found) const {
+                             bool* found,
+                             SequenceNumber* matched_sequence) const {
   *found = false;
   std::string block_data;
   Status status = ReadRawBlock(index, &block_data);
@@ -848,6 +852,7 @@ Status SSTable::GetFromBlock(const IndexEntry& index,
     for (const auto& entry : entries) {
       if (entry.key == key && entry.sequence <= read_sequence) {
         *found = true;
+        if (matched_sequence != nullptr) *matched_sequence = entry.sequence;
         if (!entry.deleted) {
           *value = entry.value;
         }
@@ -901,6 +906,7 @@ Status SSTable::GetFromBlock(const IndexEntry& index,
 
     if (entry.key == key && entry.sequence <= read_sequence) {
       *found = true;
+      if (matched_sequence != nullptr) *matched_sequence = entry.sequence;
       if (!entry.deleted) {
         *value = entry.value;
       }

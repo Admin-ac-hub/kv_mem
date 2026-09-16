@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -40,5 +41,17 @@ Status ComputeVectorDistance(const std::vector<float>& lhs,
                              const std::vector<float>& rhs,
                              VectorDistanceMetric metric,
                              float* distance);
+
+// This is the validation-free form used by the HNSW hot path after dimensions
+// and vector contents have already been checked at insertion/query boundaries.
+float ComputeVectorDistanceUnchecked(const float* lhs,
+                                     const float* rhs,
+                                     size_t dimension,
+                                     VectorDistanceMetric metric);
+
+// True only when the process can use the optional AVX2 implementation.
+bool VectorDistanceUsesAVX2();
+// "avx2", "neon", or "scalar" for reproducible benchmark reports.
+const char* VectorDistanceBackend();
 
 }  // namespace kv

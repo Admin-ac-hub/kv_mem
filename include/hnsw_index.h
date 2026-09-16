@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <random>
 #include <shared_mutex>
@@ -17,6 +18,7 @@ namespace kv {
 
 struct HNSWOptions {
   size_t dimension = 0;
+  // M: new nodes select M neighbors; reverse links may grow level 0 to 2*M.
   size_t max_neighbors = 16;
   size_t ef_construction = 200;
   VectorDistanceMetric metric = VectorDistanceMetric::kL2;
@@ -29,10 +31,11 @@ struct HNSWStats {
   size_t max_neighbor_count = 0;
   int max_level = -1;
   std::vector<size_t> nodes_per_level;
+  std::vector<size_t> max_neighbors_per_level;
 };
 
-// In-memory HNSW index. Insertions are serialized while searches may run
-// concurrently. Persistence and LSM visibility are handled by later layers.
+// HNSW index. Insertions and file loads are serialized while searches may run
+// concurrently. Version visibility is tracked by sequence and tombstones.
 class HNSWIndex {
  public:
   explicit HNSWIndex(HNSWOptions options);
@@ -48,6 +51,12 @@ class HNSWIndex {
                        const std::vector<float>& vector,
                        std::string metadata = {});
   Status MarkDeleted(std::string key, SequenceNumber sequence);
+  Status Save(const std::filesystem::path& path) const;
+  Status Load(const std::filesystem::path& path);
+  Status MergeFrom(const std::filesystem::path& path);
+  // Atomically replace the graph state while keeping the index object alive.
+  // MemTables and in-flight searches hold shared pointers to this object.
+  Status ReplaceWith(HNSWIndex&& other);
   Status Search(const std::vector<float>& query,
                 size_t top_k,
                 size_t ef_search,
@@ -57,6 +66,16 @@ class HNSWIndex {
                           size_t ef_search,
                           SequenceNumber read_sequence,
                           std::vector<VectorResult>* results) const;
+  Status SearchBatch(const std::vector<std::vector<float>>& queries,
+                     size_t top_k,
+                     size_t ef_search,
+                     std::vector<std::vector<VectorResult>>* results) const;
+  Status SearchBatchAtSequence(
+      const std::vector<std::vector<float>>& queries,
+      size_t top_k,
+      size_t ef_search,
+      SequenceNumber read_sequence,
+      std::vector<std::vector<VectorResult>>* results) const;
 
   size_t Size() const;
   HNSWStats Stats() const;
@@ -68,7 +87,8 @@ class HNSWIndex {
     NodeId id = 0;
     std::string key;
     SequenceNumber sequence = 0;
-    std::vector<float> vector;
+    // Vectors live in vector_data_ as one contiguous, cache-friendly array.
+    size_t vector_offset = 0;
     std::string metadata;
     std::vector<std::vector<NodeId>> neighbors;
   };
@@ -96,8 +116,9 @@ class HNSWIndex {
   static bool CandidateIsBetter(const Candidate& lhs,
                                 const Candidate& rhs);
   int SelectLevel();
-  float Distance(const std::vector<float>& lhs,
-                 const std::vector<float>& rhs) const;
+  float Distance(const float* lhs, const float* rhs) const;
+  const float* VectorData(NodeId node_id) const;
+  bool VectorEquals(NodeId node_id, const std::vector<float>& vector) const;
   std::vector<Candidate> SearchLayer(
       const std::vector<float>& query,
       const std::vector<NodeId>& entry_points,
@@ -111,18 +132,25 @@ class HNSWIndex {
                const std::vector<NodeId>& neighbors,
                int level);
   void PruneNeighbors(NodeId node_id, int level);
+  size_t NeighborLimit(int level) const;
   bool IsVisible(NodeId node_id, SequenceNumber read_sequence) const;
   Status InsertVersionLocked(std::string key,
                              SequenceNumber sequence,
                              const std::vector<float>& vector,
                              std::string metadata,
                              bool allow_existing_key);
+  Status SearchAtSequenceLocked(const std::vector<float>& query,
+                                size_t top_k,
+                                size_t ef_search,
+                                SequenceNumber read_sequence,
+                                std::vector<VectorResult>* results) const;
 
   HNSWOptions options_;
   double level_multiplier_ = 0.0;
   int max_level_ = -1;
   NodeId entry_point_ = 0;
   std::vector<Node> nodes_;
+  std::vector<float> vector_data_;
   std::unordered_map<std::string,
                      std::map<SequenceNumber, VersionState>> versions_by_key_;
   std::mt19937_64 random_;

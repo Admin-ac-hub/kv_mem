@@ -51,7 +51,11 @@ std::string BuildEditPayload(const VersionEdit& persisted, const VersionEdit& ne
           << item.second.level << ' '
           << std::quoted(item.second.smallest_key) << ' '
           << std::quoted(item.second.largest_key) << ' '
-          << item.second.file_size << '\n';
+          << item.second.file_size;
+      if (!item.second.index_path.empty()) {
+        out << ' ' << std::quoted(item.second.index_path.filename().string());
+      }
+      out << '\n';
     }
   }
   return out.str();
@@ -149,6 +153,21 @@ Status ParseEditPayload(const std::filesystem::path& db_path,
         meta.smallest_key.clear();
         meta.largest_key.clear();
         meta.file_size = 0;
+      } else {
+        line_stream >> std::ws;
+        if (!line_stream.eof()) {
+          std::string index_file;
+          if (!(line_stream >> std::quoted(index_file))) {
+            return Status::Corruption("invalid MANIFEST index file entry");
+          }
+          std::string trailing;
+          if (line_stream >> trailing || index_file.empty() ||
+              index_file.find('/') != std::string::npos ||
+              index_file.find('\\') != std::string::npos) {
+            return Status::Corruption("invalid MANIFEST index file name");
+          }
+          meta.index_path = db_path / index_file;
+        }
       }
       std::uint64_t parsed_number = 0;
       if (!ParseSSTableFileName(meta.file_path, &parsed_number) ||

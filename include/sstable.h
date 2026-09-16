@@ -32,13 +32,16 @@ class SSTable : public std::enable_shared_from_this<SSTable> {
                      std::shared_ptr<SSTable>* table);
   ~SSTable();
 
+  // matched_sequence is set only when a visible value or tombstone is found.
   Status Get(const std::string& key,
              SequenceNumber read_sequence,
-             std::optional<std::string>* value) const;
+             std::optional<std::string>* value,
+             SequenceNumber* matched_sequence = nullptr) const;
   Status Get(const std::string& key,
              SequenceNumber read_sequence,
              std::string* value,
-             bool* found) const;
+             bool* found,
+             SequenceNumber* matched_sequence = nullptr) const;
   Status Entries(std::vector<VersionedEntry>* entries) const;
   std::unique_ptr<InternalIterator> NewIterator(SequenceNumber read_sequence) const;
   std::uint64_t FileNumber() const;
@@ -65,7 +68,8 @@ class SSTable : public std::enable_shared_from_this<SSTable> {
                       const std::string& key,
                       SequenceNumber read_sequence,
                       std::optional<std::string>* value,
-                      bool* found) const;
+                      bool* found,
+                      SequenceNumber* matched_sequence) const;
   Status DecodeBlock(const std::string& block_data,
                      std::vector<VersionedEntry>* entries) const;
 

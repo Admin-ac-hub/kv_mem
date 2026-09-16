@@ -1,13 +1,27 @@
-build/
-/build-bench/
-/build-week5*/
+# Build directories (all variants: build/, build-first5/, build-next-stage/,
+# build-week5*/, build-week6*/, build-bench/, build-sanitized/, ...)
+/build/
+/build-*/
 /cmake-build-*/
+
+# Editor / OS
 /.VSCodeCounter/
 .idea/
 .DS_Store
+
+# Benchmark, stress and ad-hoc database directories
 bench_runs/
 stress_runs/
 bench_db/
 test/test_dbs/
+**/stress_dbs/
+**/week6_vector_bench/
+
+# Locally built diagnostic tools (source lives in tools/)
+/tools/hnsw_recall_probe
+
+# Agent scratch space
+.workbuddy-ai/
+
 *.tmp
 *.log

@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -43,6 +44,10 @@ struct Options {
   bool testing_fail_flush = false;
   bool enable_event_log = false;
   std::function<void()> testing_after_read_version_pin = {};
+  std::function<void()> testing_before_compaction_publish = {};
+  // Byte budget for L1, independent of entry count and vector dimension.
+  // Appended to preserve the order of existing aggregate initializers.
+  std::uint64_t level1_size_limit_bytes = 64ULL * 1024 * 1024;
 };
 
 struct DBStats {
@@ -57,6 +62,8 @@ struct DBStats {
   std::uint64_t block_reads = 0;
   std::uint64_t sstable_full_scans = 0;
   std::uint64_t block_restart_seeks = 0;
+  // Counts successfully published flushes over this DB object's lifetime.
+  std::uint64_t flush_count = 0;
 };
 
 class Snapshot {
@@ -126,9 +133,16 @@ class DB {
                 size_t top_k,
                 std::vector<VectorResult>* results,
                 const ReadOptions& options = {});
+  Status SearchBatch(const std::vector<std::vector<float>>& queries,
+                     size_t top_k,
+                     size_t ef_search,
+                     std::vector<std::vector<VectorResult>>* results,
+                     const ReadOptions& options = {});
   Status Delete(const std::string& key);
   Status Compact();
   DBStats Stats() const;
+  // Explicit O(nodes + edges) inspection; avoids slowing the lightweight Stats().
+  HNSWStats VectorIndexStats() const;
   const Snapshot* GetSnapshot();
   void ReleaseSnapshot(const Snapshot* snapshot);
   std::unique_ptr<Iterator> NewIterator(const ReadOptions& options = {});
@@ -143,6 +157,15 @@ class DB {
   Status OpenSSTables();
   Status RebuildVectorIndex();
   Status AddVectorIndexEntry(const VersionedEntry& entry);
+  Status AddVectorIndexEntryTo(const std::shared_ptr<HNSWIndex>& index,
+                               const VersionedEntry& entry) const;
+  Status BuildVectorIndexForCompaction(
+      const std::vector<VersionedEntry>& output,
+      const std::set<std::uint64_t>& input_numbers,
+      const std::vector<std::shared_ptr<SSTable>>& tables,
+      std::shared_ptr<HNSWIndex>* rebuilt) const;
+  Status SaveVectorIndexEntries(const std::vector<VersionedEntry>& entries,
+                                const std::filesystem::path& path) const;
   Status Recover();
   Status MaybeFlushMemTable();
   Status FlushMemTable();
@@ -160,6 +183,7 @@ class DB {
   Status SaveManifest();
   void LogEvent(const std::string& message) const;
   std::filesystem::path SSTablePath(std::uint64_t number) const;
+  std::filesystem::path HNSWIndexPath(std::uint64_t number) const;
   std::filesystem::path WALPath(std::uint64_t number) const;
 
   Options options_;
@@ -174,6 +198,7 @@ class DB {
   std::shared_ptr<BlockCache> block_cache_;
   std::vector<std::unique_ptr<Snapshot>> snapshots_;
   std::uint64_t compaction_count_ = 0;
+  std::uint64_t flush_count_ = 0;
   std::uint64_t sstable_full_scans_ = 0;
   std::thread background_worker_;
   std::condition_variable background_cv_;
@@ -182,6 +207,7 @@ class DB {
   bool closed_ = true;
   Status background_status_;
   mutable std::mutex write_mu_;
+  mutable std::mutex compaction_mu_;
   mutable std::mutex version_mu_;
   mutable std::shared_mutex memtable_mu_;
   mutable std::mutex bg_mu_;

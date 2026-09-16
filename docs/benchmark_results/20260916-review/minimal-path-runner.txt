@@ -1,0 +1,118 @@
+-- The CXX compiler identification is AppleClang 21.0.0.21000101
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring done (0.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/ys/cppProject/KV/build-review-runner
+[1/15] Building CXX object CMakeFiles/kvdb.dir/src/block_cache.cc.o
+[2/15] Building CXX object CMakeFiles/kvdb.dir/src/bloom_filter.cc.o
+[3/15] Building CXX object CMakeFiles/kvdb.dir/src/write_batch.cc.o
+[4/15] Building CXX object CMakeFiles/kvdb.dir/src/skiplist.cc.o
+[5/15] Building CXX object CMakeFiles/kvdb.dir/src/format.cc.o
+[6/15] Building CXX object CMakeFiles/kvdb.dir/src/memtable.cc.o
+[7/15] Building CXX object CMakeFiles/kvdb.dir/src/wal.cc.o
+[8/15] Building CXX object CMakeFiles/kvdb.dir/src/vector_value.cc.o
+[9/15] Building CXX object CMakeFiles/kvdb.dir/src/sstable.cpp.o
+[10/15] Building CXX object CMakeFiles/kvdb.dir/src/manifest.cpp.o
+[11/15] Building CXX object CMakeFiles/kvdb.dir/src/hnsw_index.cc.o
+[12/15] Building CXX object CMakeFiles/vector_bench.dir/bench/vector_bench.cpp.o
+[13/15] Building CXX object CMakeFiles/kvdb.dir/src/db.cc.o
+[14/15] Linking CXX static library libkvdb.a
+[15/15] Linking CXX executable vector_bench
+== write ==
+vectors=100
+dimension=8
+memtable_entries_limit=16
+level0_sstable_limit=1
+level1_size_limit_bytes=67108864
+block_cache_capacity=64
+hnsw_m=16
+ef_construction=200
+ef_search=128
+seed=20260907
+durability=wal_sync_per_batch
+distance_backend=neon
+avx2_enabled=false
+mode=write
+write_close_seconds=0.010433
+write_operations=100
+write_elapsed_seconds=0.013208
+write_throughput_per_second=7571.432108
+write_batch_amortized_p50_us=26.046875
+write_batch_amortized_p99_us=47.265625
+sstable_bytes=7224
+index_bytes=30416
+wal_bytes=0
+flush_count=7
+compaction_count=3
+sstable_count=2
+== query ==
+vectors=100
+dimension=8
+memtable_entries_limit=16
+level0_sstable_limit=1
+level1_size_limit_bytes=67108864
+block_cache_capacity=64
+hnsw_m=16
+ef_construction=200
+ef_search=128
+seed=20260907
+durability=wal_sync_per_batch
+distance_backend=neon
+avx2_enabled=false
+flush_count=7
+compaction_count=3
+sstable_count=2
+mode=query
+query_operations=8
+query_elapsed_seconds=0.000096
+query_throughput_per_second=83080.629751
+query_batch_amortized_p50_us=11.500000
+query_batch_amortized_p99_us=14.417000
+query_batch_size=1
+recall_query_count=4
+recall_at_10=1.000000
+sstable_bytes=7224
+index_bytes=30416
+== mixed ==
+vectors=100
+dimension=8
+memtable_entries_limit=16
+level0_sstable_limit=1
+level1_size_limit_bytes=67108864
+block_cache_capacity=64
+hnsw_m=16
+ef_construction=200
+ef_search=128
+seed=20260907
+durability=wal_sync_per_batch
+distance_backend=neon
+avx2_enabled=false
+flush_count=4
+compaction_count=2
+sstable_count=1
+mode=mixed
+mixed_wall_seconds=0.009630
+mixed_wall_write_per_second=5192.152746
+mixed_wall_query_per_second=5192.152746
+mixed_write_operations=50
+mixed_write_elapsed_seconds=0.003086
+mixed_write_throughput_per_second=16201.106276
+mixed_write_batch_amortized_p50_us=54.792000
+mixed_write_batch_amortized_p99_us=146.750000
+mixed_query_operations=50
+mixed_query_elapsed_seconds=0.000485
+mixed_query_throughput_per_second=103110.641843
+mixed_query_batch_amortized_p50_us=9.250000
+mixed_query_batch_amortized_p99_us=16.125000
+mixed_write_fraction=0.5
+mixed_query_fraction=0.5
+sstable_bytes=7090
+index_bytes=31064
+flush_count=4
+compaction_count=2
+sstable_count=1
+results: /Users/ys/cppProject/KV/bench_runs/review-20260916-minimal-path

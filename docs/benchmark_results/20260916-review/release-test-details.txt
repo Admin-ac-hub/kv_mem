@@ -1,0 +1,283 @@
+Start testing: Sep 16 19:15 CST
+----------------------------------------------------------
+1/8 Testing: kv_test
+1/8 Test: kv_test
+Command: "/Users/ys/cppProject/KV/build-review-fixes/kv_test"
+Directory: /Users/ys/cppProject/KV/build-review-fixes
+"kv_test" start time: Sep 16 19:15 CST
+Output:
+----------------------------------------------------------
+Vector persistence acceptance: index_bytes=3415728, raw_vector_bytes=3072000
+kv_test passed
+<end of output>
+Test time =   2.44 sec
+----------------------------------------------------------
+Test Passed.
+"kv_test" end time: Sep 16 19:15 CST
+"kv_test" time elapsed: 00:00:02
+----------------------------------------------------------
+
+2/8 Testing: hnsw_test
+2/8 Test: hnsw_test
+Command: "/Users/ys/cppProject/KV/build-review-fixes/hnsw_test"
+Directory: /Users/ys/cppProject/KV/build-review-fixes
+"hnsw_test" start time: Sep 16 19:15 CST
+Output:
+----------------------------------------------------------
+HNSW acceptance: Recall@10=1, average_search_us=21.9758
+hnsw_test passed
+<end of output>
+Test time =   0.38 sec
+----------------------------------------------------------
+Test Passed.
+"hnsw_test" end time: Sep 16 19:15 CST
+"hnsw_test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/8 Testing: week5_bench_sync_smoke
+3/8 Test: week5_bench_sync_smoke
+Command: "/Users/ys/cppProject/KV/build-review-fixes/week5_bench" "--mode" "sync" "--operations" "10000" "--threads" "2" "--batch-size" "8"
+Directory: /Users/ys/cppProject/KV/build-review-fixes
+"week5_bench_sync_smoke" start time: Sep 16 19:15 CST
+Output:
+----------------------------------------------------------
+mode,operations,threads,batch_size,elapsed_sec,ops_per_sec,ns_per_op,lock_free,counter
+mutex,10000,2,8,7.4708e-05,1.33854e+08,7.4708,false,10000
+atomic,10000,2,8,4.9833e-05,2.0067e+08,4.9833,true,10000
+batched-mutex,10000,2,8,2.525e-05,3.9604e+08,2.525,false,10000
+<end of output>
+Test time =   0.32 sec
+----------------------------------------------------------
+Test Passed.
+"week5_bench_sync_smoke" end time: Sep 16 19:15 CST
+"week5_bench_sync_smoke" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/8 Testing: hnsw_recall_20k_128
+4/8 Test: hnsw_recall_20k_128
+Command: "/Users/ys/cppProject/KV/build-review-fixes/hnsw_recall_probe" "regression" "20000" "128" "32" "200" "100"
+Directory: /Users/ys/cppProject/KV/build-review-fixes
+"hnsw_recall_20k_128" start time: Sep 16 19:15 CST
+Output:
+----------------------------------------------------------
+distance_backend=neon
+i.i.d. Gaussian | n=20000 dim=128 M=32 ef_c=200 | nodes=20000 max_level=2 directed_edges=971658 max_degree=64 avg_degree=48.6
+    build_seconds=16.051 queries=100
+    in_distribution ef=16   recall@10=0.5040 duplicate_keys=0 qps=15289.6
+    in_distribution ef=32   recall@10=0.7030 duplicate_keys=0 qps=11896.1
+    in_distribution ef=64   recall@10=0.8560 duplicate_keys=0 qps=6970.3
+    in_distribution ef=128  recall@10=0.9570 duplicate_keys=0 qps=4080.4
+    in_distribution ef=256  recall@10=0.9940 duplicate_keys=0 qps=2309.2
+    in_distribution ef=512  recall@10=0.9990 duplicate_keys=0 qps=1455.7
+clustered | n=20000 dim=128 M=32 ef_c=200 | nodes=20000 max_level=2 directed_edges=1044200 max_degree=64 avg_degree=52.2
+    build_seconds=3.526 queries=100
+    in_distribution ef=16   recall@10=1.0000 duplicate_keys=0 qps=48202.4
+    in_distribution ef=32   recall@10=1.0000 duplicate_keys=0 qps=56314.2
+    in_distribution ef=64   recall@10=1.0000 duplicate_keys=0 qps=42716.8
+    in_distribution ef=128  recall@10=1.0000 duplicate_keys=0 qps=21407.4
+    in_distribution ef=256  recall@10=1.0000 duplicate_keys=0 qps=12252.4
+    in_distribution ef=512  recall@10=1.0000 duplicate_keys=0 qps=5852.9
+    independent_centers_OOD ef=16   recall@10=0.5540 duplicate_keys=0 qps=40957.0
+    independent_centers_OOD ef=32   recall@10=0.5670 duplicate_keys=0 qps=42010.9
+    independent_centers_OOD ef=64   recall@10=0.6110 duplicate_keys=0 qps=31955.7
+    independent_centers_OOD ef=128  recall@10=0.7570 duplicate_keys=0 qps=16779.0
+    independent_centers_OOD ef=256  recall@10=0.8430 duplicate_keys=0 qps=10078.1
+    independent_centers_OOD ef=512  recall@10=0.9610 duplicate_keys=0 qps=5684.8
+<end of output>
+Test time =  20.39 sec
+----------------------------------------------------------
+Test Passed.
+"hnsw_recall_20k_128" end time: Sep 16 19:15 CST
+"hnsw_recall_20k_128" time elapsed: 00:00:20
+----------------------------------------------------------
+
+5/8 Testing: hnsw_recall_20k_768
+5/8 Test: hnsw_recall_20k_768
+Command: "/Users/ys/cppProject/KV/build-review-fixes/hnsw_recall_probe" "regression" "20000" "768" "32" "200" "100"
+Directory: /Users/ys/cppProject/KV/build-review-fixes
+"hnsw_recall_20k_768" start time: Sep 16 19:15 CST
+Output:
+----------------------------------------------------------
+distance_backend=neon
+i.i.d. Gaussian | n=20000 dim=768 M=32 ef_c=200 | nodes=20000 max_level=2 directed_edges=932355 max_degree=64 avg_degree=46.6
+    build_seconds=134.542 queries=100
+    in_distribution ef=16   recall@10=0.4070 duplicate_keys=0 qps=2019.8
+    in_distribution ef=32   recall@10=0.5530 duplicate_keys=0 qps=1121.2
+    in_distribution ef=64   recall@10=0.7270 duplicate_keys=0 qps=670.3
+    in_distribution ef=128  recall@10=0.8740 duplicate_keys=0 qps=409.6
+    in_distribution ef=256  recall@10=0.9560 duplicate_keys=0 qps=245.9
+    in_distribution ef=512  recall@10=0.9920 duplicate_keys=0 qps=161.4
+clustered | n=20000 dim=768 M=32 ef_c=200 | nodes=20000 max_level=2 directed_edges=1043571 max_degree=64 avg_degree=52.2
+    build_seconds=17.984 queries=100
+    in_distribution ef=16   recall@10=0.9700 duplicate_keys=0 qps=16176.3
+    in_distribution ef=32   recall@10=0.9700 duplicate_keys=0 qps=16225.0
+    in_distribution ef=64   recall@10=0.9800 duplicate_keys=0 qps=13458.5
+    in_distribution ef=128  recall@10=1.0000 duplicate_keys=0 qps=6202.8
+    in_distribution ef=256  recall@10=1.0000 duplicate_keys=0 qps=3091.4
+    in_distribution ef=512  recall@10=1.0000 duplicate_keys=0 qps=1835.7
+    independent_centers_OOD ef=16   recall@10=0.4990 duplicate_keys=0 qps=12417.0
+    independent_centers_OOD ef=32   recall@10=0.5090 duplicate_keys=0 qps=11079.0
+    independent_centers_OOD ef=64   recall@10=0.5210 duplicate_keys=0 qps=8000.4
+    independent_centers_OOD ef=128  recall@10=0.6260 duplicate_keys=0 qps=4200.4
+    independent_centers_OOD ef=256  recall@10=0.7420 duplicate_keys=0 qps=2749.3
+    independent_centers_OOD ef=512  recall@10=0.9190 duplicate_keys=0 qps=1526.7
+<end of output>
+Test time = 155.53 sec
+----------------------------------------------------------
+Test Passed.
+"hnsw_recall_20k_768" end time: Sep 16 19:18 CST
+"hnsw_recall_20k_768" time elapsed: 00:02:35
+----------------------------------------------------------
+
+6/8 Testing: vector_bench_maintenance
+6/8 Test: vector_bench_maintenance
+Command: "/Users/ys/cppProject/KV/build-review-fixes/vector_bench" "--mode" "write" "--path" "/Users/ys/cppProject/KV/build-review-fixes/vector_maintenance_bench" "--vectors" "100" "--dimension" "8" "--write-batch" "8" "--memtable-limit" "16" "--l0-limit" "1" "--require-maintenance" "--reset"
+Directory: /Users/ys/cppProject/KV/build-review-fixes
+"vector_bench_maintenance" start time: Sep 16 19:18 CST
+Output:
+----------------------------------------------------------
+vectors=100
+dimension=8
+memtable_entries_limit=16
+level0_sstable_limit=1
+level1_size_limit_bytes=67108864
+block_cache_capacity=64
+hnsw_m=16
+ef_construction=200
+ef_search=128
+seed=20260907
+durability=wal_sync_per_batch
+distance_backend=neon
+avx2_enabled=false
+mode=write
+write_close_seconds=0.016915
+write_operations=100
+write_elapsed_seconds=0.025034
+write_throughput_per_second=3994.600738
+write_batch_amortized_p50_us=57.224000
+write_batch_amortized_p99_us=657.979000
+sstable_bytes=7224
+index_bytes=30416
+wal_bytes=0
+flush_count=7
+compaction_count=3
+sstable_count=2
+<end of output>
+Test time =   0.75 sec
+----------------------------------------------------------
+Test Passed.
+"vector_bench_maintenance" end time: Sep 16 19:18 CST
+"vector_bench_maintenance" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/8 Testing: vector_bench_smoke
+7/8 Test: vector_bench_smoke
+Command: "/Users/ys/cppProject/KV/build-review-fixes/vector_bench" "--mode" "all" "--path" "/Users/ys/cppProject/KV/build-review-fixes/week6_vector_bench" "--vectors" "100" "--dimension" "8" "--queries" "8" "--recall-queries" "2" "--mixed-operations" "20" "--write-batch" "8" "--query-batch" "4" "--ef-search" "32" "--reset"
+Directory: /Users/ys/cppProject/KV/build-review-fixes
+"vector_bench_smoke" start time: Sep 16 19:18 CST
+Output:
+----------------------------------------------------------
+vectors=100
+dimension=8
+memtable_entries_limit=1024
+level0_sstable_limit=4
+level1_size_limit_bytes=67108864
+block_cache_capacity=64
+hnsw_m=16
+ef_construction=200
+ef_search=32
+seed=20260907
+durability=wal_sync_per_batch
+distance_backend=neon
+avx2_enabled=false
+mode=write
+write_close_seconds=0.003063
+write_operations=100
+write_elapsed_seconds=0.006079
+write_throughput_per_second=16449.849426
+write_batch_amortized_p50_us=30.354250
+write_batch_amortized_p99_us=61.239750
+sstable_bytes=7090
+index_bytes=31064
+wal_bytes=0
+flush_count=1
+compaction_count=0
+sstable_count=1
+flush_count=1
+compaction_count=0
+sstable_count=1
+mode=query
+query_operations=8
+query_elapsed_seconds=0.000074
+query_throughput_per_second=108658.743633
+query_batch_amortized_p50_us=10.104000
+query_batch_amortized_p99_us=10.104000
+query_batch_size=4
+recall_query_count=2
+recall_at_10=1.000000
+sstable_bytes=7090
+index_bytes=31064
+flush_count=1
+compaction_count=0
+sstable_count=1
+mode=mixed
+mixed_wall_seconds=0.001039
+mixed_wall_write_per_second=9626.566242
+mixed_wall_query_per_second=9626.566242
+mixed_write_operations=10
+mixed_write_elapsed_seconds=0.000354
+mixed_write_throughput_per_second=28285.182524
+mixed_write_batch_amortized_p50_us=32.750000
+mixed_write_batch_amortized_p99_us=44.833500
+mixed_query_operations=10
+mixed_query_elapsed_seconds=0.000071
+mixed_query_throughput_per_second=141342.756184
+mixed_query_batch_amortized_p50_us=6.854250
+mixed_query_batch_amortized_p99_us=7.635500
+mixed_write_fraction=0.5
+mixed_query_fraction=0.5
+sstable_bytes=4391
+index_bytes=17196
+flush_count=1
+compaction_count=0
+sstable_count=2
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"vector_bench_smoke" end time: Sep 16 19:18 CST
+"vector_bench_smoke" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/8 Testing: kv_stress_fixed_seed
+8/8 Test: kv_stress_fixed_seed
+Command: "/Users/ys/cppProject/KV/build-review-fixes/kv_stress" "--path" "/Users/ys/cppProject/KV/build-review-fixes/stress_dbs/kv_stress_fixed_seed" "--epochs" "2" "--threads" "4" "--ops-per-thread" "250" "--keys-per-thread" "128" "--value-size" "64" "--delete-percent" "25" "--batch-size" "4" "--reopen-every-epochs" "1" "--compact-every-epochs" "1" "--seed" "20260712" "--memtable-limit" "32" "--l0-limit" "2"
+Directory: /Users/ys/cppProject/KV/build-review-fixes
+"kv_stress_fixed_seed" start time: Sep 16 19:18 CST
+Output:
+----------------------------------------------------------
+kv_stress start path="/Users/ys/cppProject/KV/build-review-fixes/stress_dbs/kv_stress_fixed_seed" epochs=2 threads=4 ops_per_thread=250 keys_per_thread=128 seed=20260712
+epoch=1 puts=770 deletes=230 reads=12 batches=252 model_size=329 sstables=4 compactions=9 cache_hits=54 cache_misses=70 bloom_filtered=298 block_reads=9
+reopen verified epoch=1
+epoch=2 puts=1522 deletes=478 reads=24 batches=504 model_size=378 sstables=4 compactions=9 cache_hits=148 cache_misses=102 bloom_filtered=289 block_reads=12
+reopen verified epoch=2
+epoch=2 puts=1522 deletes=478 reads=24 batches=504 model_size=378 sstables=3 compactions=0 cache_hits=90 cache_misses=16 bloom_filtered=292 block_reads=16
+kv_stress passed
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"kv_stress_fixed_seed" end time: Sep 16 19:18 CST
+"kv_stress_fixed_seed" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Sep 16 19:18 CST
+
+benchmark =   1.10 sec*proc
+
+recall = 175.92 sec*proc
+
+slow = 175.92 sec*proc
+
+stress =   0.06 sec*proc
+

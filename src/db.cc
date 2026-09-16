@@ -409,6 +409,7 @@ Status DB::Close() {
     background_worker_.join();
   }
 
+  std::lock_guard<std::mutex> compaction_lock(compaction_mu_);
   lock.lock();
   Status status = background_status_;
   if (wal_ != nullptr) {
@@ -587,18 +588,29 @@ Status DB::Get(const std::string& key, std::string* value, const ReadOptions& op
     }
   }
 
+  // A compaction can publish after a concurrent flush. File number and vector
+  // order therefore do not determine which table contains the newest version.
+  bool have_visible = false;
+  bool newest_deleted = false;
+  SequenceNumber newest_sequence = 0;
   for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
     bool found = false;
-    status = (*it)->Get(key, read_sequence, value, &found);
-    if (status.ok()) {
+    SequenceNumber sequence = 0;
+    std::string candidate;
+    status = (*it)->Get(key, read_sequence, &candidate, &found, &sequence);
+    if (!status.ok() && !status.IsNotFound()) {
       return status;
     }
-    if (found && status.IsNotFound()) {
-      return status;
+    if (found && (!have_visible || sequence > newest_sequence)) {
+      have_visible = true;
+      newest_sequence = sequence;
+      newest_deleted = status.IsNotFound();
+      if (!newest_deleted) *value = std::move(candidate);
+      if (sequence == read_sequence) break;
     }
-    if (!status.IsNotFound()) {
-      return status;
-    }
+  }
+  if (have_visible) {
+    return newest_deleted ? Status::NotFound("key deleted") : Status::OK();
   }
 
   return Status::NotFound("key not found");
@@ -753,6 +765,36 @@ Status DB::Search(const std::vector<float>& query,
   return Search(query, top_k, 64, results, options);
 }
 
+Status DB::SearchBatch(
+    const std::vector<std::vector<float>>& queries,
+    size_t top_k,
+    size_t ef_search,
+    std::vector<std::vector<VectorResult>>* results,
+    const ReadOptions& options) {
+  if (results == nullptr) {
+    return Status::InvalidArgument("batch search results output cannot be null");
+  }
+  results->clear();
+
+  std::shared_ptr<HNSWIndex> index;
+  SequenceNumber read_sequence = 0;
+  {
+    std::lock_guard<std::mutex> lock(version_mu_);
+    if (closed_) {
+      return Status::IOError("database is not open");
+    }
+    if (vector_index_ == nullptr) {
+      return Status::InvalidArgument(
+          "indexed search requires a configured vector dimension");
+    }
+    index = vector_index_;
+    read_sequence = ReadSequence(options);
+  }
+
+  return index->SearchBatchAtSequence(queries, top_k, ef_search,
+                                      read_sequence, results);
+}
+
 Status DB::Delete(const std::string& key) {
   WriteBatch batch;
   batch.Delete(key);
@@ -760,78 +802,98 @@ Status DB::Delete(const std::string& key) {
 }
 
 Status DB::Compact() {
-  std::lock_guard<std::mutex> lock(version_mu_);
+  std::lock_guard<std::mutex> lock(compaction_mu_);
   return CompactUnlocked();
 }
 
 Status DB::CompactUnlocked() {
-  if (sstables_.empty()) {
-    return Status::OK();
-  }
-
-  const VersionEdit old_edit = manifest_->CurrentEdit();
-  const auto& metas = old_edit.sstables;
+  std::vector<std::shared_ptr<SSTable>> base_tables;
   std::vector<SSTableMeta> inputs;
   int target_level = 1;
+  SequenceNumber min_snapshot = 0;
+  std::uint64_t new_file_number = 0;
+  std::shared_ptr<HNSWIndex> index;
 
-  auto add_overlapping = [&](int level, const SSTableMeta& range) {
-    for (const auto& meta : metas) {
-      if (meta.level == level && RangesOverlap(meta, range)) {
-        auto exists = std::find_if(inputs.begin(), inputs.end(),
-                                   [&](const SSTableMeta& selected) {
-                                     return selected.file_number == meta.file_number;
-                                   });
-        if (exists == inputs.end()) {
-          inputs.push_back(meta);
+  {
+    std::lock_guard<std::mutex> lock(version_mu_);
+    if (closed_) {
+      return Status::IOError("database is not open");
+    }
+    if (!background_status_.ok()) {
+      return background_status_;
+    }
+    if (sstables_.empty()) {
+      return Status::OK();
+    }
+
+    base_tables = sstables_;
+    const auto& metas = manifest_->SSTables();
+    auto add_overlapping = [&](int level, const SSTableMeta& range) {
+      for (const auto& meta : metas) {
+        if (meta.level == level && RangesOverlap(meta, range)) {
+          auto exists = std::find_if(inputs.begin(), inputs.end(),
+                                     [&](const SSTableMeta& selected) {
+                                       return selected.file_number == meta.file_number;
+                                     });
+          if (exists == inputs.end()) {
+            inputs.push_back(meta);
+          }
         }
       }
-    }
-  };
+    };
 
-  for (const auto& meta : metas) {
-    if (meta.level == 0) {
-      inputs.push_back(meta);
-    }
-  }
-  if (!inputs.empty()) {
-    target_level = 1;
-    SSTableMeta combined_range = inputs.front();
-    for (const auto& meta : inputs) {
-      if (combined_range.smallest_key.empty() ||
-          (!meta.smallest_key.empty() && meta.smallest_key < combined_range.smallest_key)) {
-        combined_range.smallest_key = meta.smallest_key;
-      }
-      if (combined_range.largest_key.empty() ||
-          (!meta.largest_key.empty() && meta.largest_key > combined_range.largest_key)) {
-        combined_range.largest_key = meta.largest_key;
-      }
-    }
-    add_overlapping(1, combined_range);
-  } else {
     for (const auto& meta : metas) {
-      if (meta.level == 1) {
+      if (meta.level == 0) {
         inputs.push_back(meta);
       }
     }
-    target_level = 2;
     if (!inputs.empty()) {
+      target_level = 1;
       SSTableMeta combined_range = inputs.front();
       for (const auto& meta : inputs) {
         if (combined_range.smallest_key.empty() ||
-            (!meta.smallest_key.empty() && meta.smallest_key < combined_range.smallest_key)) {
+            (!meta.smallest_key.empty() &&
+             meta.smallest_key < combined_range.smallest_key)) {
           combined_range.smallest_key = meta.smallest_key;
         }
         if (combined_range.largest_key.empty() ||
-            (!meta.largest_key.empty() && meta.largest_key > combined_range.largest_key)) {
+            (!meta.largest_key.empty() &&
+             meta.largest_key > combined_range.largest_key)) {
           combined_range.largest_key = meta.largest_key;
         }
       }
-      add_overlapping(2, combined_range);
+      add_overlapping(1, combined_range);
+    } else {
+      for (const auto& meta : metas) {
+        if (meta.level == 1) {
+          inputs.push_back(meta);
+        }
+      }
+      target_level = 2;
+      if (!inputs.empty()) {
+        SSTableMeta combined_range = inputs.front();
+        for (const auto& meta : inputs) {
+          if (combined_range.smallest_key.empty() ||
+              (!meta.smallest_key.empty() &&
+               meta.smallest_key < combined_range.smallest_key)) {
+            combined_range.smallest_key = meta.smallest_key;
+          }
+          if (combined_range.largest_key.empty() ||
+              (!meta.largest_key.empty() &&
+               meta.largest_key > combined_range.largest_key)) {
+            combined_range.largest_key = meta.largest_key;
+          }
+        }
+        add_overlapping(2, combined_range);
+      }
     }
-  }
 
-  if (inputs.empty()) {
-    return Status::OK();
+    if (inputs.empty()) {
+      return Status::OK();
+    }
+    min_snapshot = MinActiveSnapshotSequence();
+    new_file_number = manifest_->AllocateFileNumber();
+    index = vector_index_;
   }
 
   std::set<std::uint64_t> input_numbers;
@@ -842,7 +904,7 @@ Status DB::CompactUnlocked() {
            " -> L" + std::to_string(target_level));
 
   std::vector<std::unique_ptr<InternalIterator>> compaction_inputs;
-  for (const auto& table : sstables_) {
+  for (const auto& table : base_tables) {
     if (input_numbers.find(table->FileNumber()) == input_numbers.end()) {
       continue;
     }
@@ -857,7 +919,6 @@ Status DB::CompactUnlocked() {
   }
 
   std::vector<VersionedEntry> output;
-  const SequenceNumber min_snapshot = MinActiveSnapshotSequence();
   struct CompactionHeapCompare {
     const std::vector<std::unique_ptr<InternalIterator>>* inputs = nullptr;
 
@@ -930,61 +991,186 @@ Status DB::CompactUnlocked() {
               return lhs.sequence > rhs.sequence;
             });
 
-  const std::vector<std::shared_ptr<SSTable>> old_tables = sstables_;
-  const std::uint64_t new_file_number = manifest_->AllocateFileNumber();
   const std::filesystem::path new_path = SSTablePath(new_file_number);
+  const std::filesystem::path new_index_path = HNSWIndexPath(new_file_number);
+  auto cleanup_new_files = [&] {
+    (void)RemoveFileIfExists(new_path);
+    if (index != nullptr) {
+      (void)RemoveFileIfExists(new_index_path);
+    }
+  };
   Status status = SSTable::CreateFromEntries(new_path, output,
                                              options_.block_size,
                                              options_.bloom_bits_per_key);
   if (!status.ok()) {
+    cleanup_new_files();
     return status;
   }
 
   std::shared_ptr<SSTable> new_table;
   status = SSTable::Open(new_file_number, new_path, block_cache_, &new_table);
   if (!status.ok()) {
+    cleanup_new_files();
     return status;
   }
-
-  sstables_.erase(std::remove_if(sstables_.begin(), sstables_.end(),
-                                 [&](const std::shared_ptr<SSTable>& table) {
-                                   return input_numbers.find(table->FileNumber()) !=
-                                          input_numbers.end();
-                                 }),
-                  sstables_.end());
-  sstables_.push_back(new_table);
-  std::vector<SSTableMeta> new_metas;
-  for (const auto& meta : old_edit.sstables) {
-    if (input_numbers.find(meta.file_number) == input_numbers.end()) {
-      new_metas.push_back(meta);
+  if (index != nullptr) {
+    status = SaveVectorIndexEntries(output, new_index_path);
+    if (!status.ok()) {
+      new_table.reset();
+      cleanup_new_files();
+      return status;
     }
   }
-  SSTableMeta new_meta;
-  new_meta.file_number = new_table->FileNumber();
-  new_meta.file_path = new_table->FilePath();
-  new_meta.level = target_level;
-  std::error_code file_size_ec;
-  new_meta.file_size = std::filesystem::file_size(new_meta.file_path, file_size_ec);
-  if (file_size_ec) {
-    new_meta.file_size = 0;
+
+  std::shared_ptr<HNSWIndex> rebuilt_index;
+  if (index != nullptr) {
+    status = BuildVectorIndexForCompaction(output, input_numbers, base_tables,
+                                           &rebuilt_index);
+    if (!status.ok()) {
+      new_table.reset();
+      cleanup_new_files();
+      return status;
+    }
   }
-  if (!output.empty()) {
-    auto minmax = std::minmax_element(
-        output.begin(), output.end(),
-        [](const VersionedEntry& lhs, const VersionedEntry& rhs) {
-          return lhs.key < rhs.key;
-        });
-    new_meta.smallest_key = minmax.first->key;
-    new_meta.largest_key = minmax.second->key;
+
+  if (options_.testing_before_compaction_publish) {
+    options_.testing_before_compaction_publish();
   }
-  new_metas.push_back(std::move(new_meta));
-  manifest_->SetSSTables(std::move(new_metas));
-  manifest_->SetLastSequence(old_edit.last_sequence);
-  status = SaveManifest();
-  if (!status.ok()) {
-    sstables_ = old_tables;
-    manifest_->SetCurrentEdit(old_edit);
-    return status;
+
+  std::vector<std::shared_ptr<SSTable>> old_tables;
+  std::vector<SSTableMeta> old_metas;
+  {
+    std::lock_guard<std::mutex> lock(version_mu_);
+    if (closed_ || vector_index_ != index) {
+      new_table.reset();
+      cleanup_new_files();
+      return Status::IOError("database changed while compaction was building");
+    }
+
+    const auto& current_metas = manifest_->SSTables();
+    for (std::uint64_t input_number : input_numbers) {
+      const bool still_live = std::any_of(
+          current_metas.begin(), current_metas.end(),
+          [input_number](const SSTableMeta& meta) {
+            return meta.file_number == input_number;
+          });
+      if (!still_live) {
+        new_table.reset();
+        cleanup_new_files();
+        return Status::IOError("compaction input changed before publish");
+      }
+    }
+
+    if (rebuilt_index != nullptr) {
+      std::set<std::uint64_t> base_table_numbers;
+      for (const auto& table : base_tables) {
+        if (input_numbers.find(table->FileNumber()) == input_numbers.end()) {
+          base_table_numbers.insert(table->FileNumber());
+        }
+      }
+      for (const auto& table : sstables_) {
+        if (input_numbers.find(table->FileNumber()) != input_numbers.end() ||
+            base_table_numbers.find(table->FileNumber()) !=
+                base_table_numbers.end()) {
+          continue;
+        }
+        std::vector<VersionedEntry> entries;
+        status = table->Entries(&entries);
+        if (!status.ok()) {
+          new_table.reset();
+          cleanup_new_files();
+          return status;
+        }
+        for (const auto& entry : entries) {
+          status = AddVectorIndexEntryTo(rebuilt_index, entry);
+          if (!status.ok()) {
+            new_table.reset();
+            cleanup_new_files();
+            return status;
+          }
+        }
+      }
+
+      std::shared_lock<std::shared_mutex> memtable_lock(memtable_mu_);
+      for (const auto& immutable : immutable_memtables_) {
+        for (const auto& entry : immutable.memtable->Entries()) {
+          status = AddVectorIndexEntryTo(rebuilt_index, entry);
+          if (!status.ok()) {
+            new_table.reset();
+            cleanup_new_files();
+            return status;
+          }
+        }
+      }
+      if (active_memtable_ != nullptr) {
+        for (const auto& entry : active_memtable_->Entries()) {
+          status = AddVectorIndexEntryTo(rebuilt_index, entry);
+          if (!status.ok()) {
+            new_table.reset();
+            cleanup_new_files();
+            return status;
+          }
+        }
+      }
+    }
+
+    const VersionEdit publish_edit = manifest_->CurrentEdit();
+    old_tables = sstables_;
+    old_metas = publish_edit.sstables;
+    sstables_.erase(std::remove_if(
+                        sstables_.begin(), sstables_.end(),
+                        [&](const std::shared_ptr<SSTable>& table) {
+                          return input_numbers.find(table->FileNumber()) !=
+                                 input_numbers.end();
+                        }),
+                    sstables_.end());
+    sstables_.push_back(new_table);
+
+    std::vector<SSTableMeta> new_metas;
+    for (const auto& meta : publish_edit.sstables) {
+      if (input_numbers.find(meta.file_number) == input_numbers.end()) {
+        new_metas.push_back(meta);
+      }
+    }
+    SSTableMeta new_meta;
+    new_meta.file_number = new_table->FileNumber();
+    new_meta.file_path = new_table->FilePath();
+    new_meta.index_path = index == nullptr ? std::filesystem::path{}
+                                           : new_index_path;
+    new_meta.level = target_level;
+    std::error_code file_size_ec;
+    new_meta.file_size =
+        std::filesystem::file_size(new_meta.file_path, file_size_ec);
+    if (file_size_ec) {
+      new_meta.file_size = 0;
+    }
+    if (!output.empty()) {
+      auto minmax = std::minmax_element(
+          output.begin(), output.end(),
+          [](const VersionedEntry& lhs, const VersionedEntry& rhs) {
+            return lhs.key < rhs.key;
+          });
+      new_meta.smallest_key = minmax.first->key;
+      new_meta.largest_key = minmax.second->key;
+    }
+    new_metas.push_back(std::move(new_meta));
+    manifest_->SetSSTables(std::move(new_metas));
+    status = SaveManifest();
+    if (!status.ok()) {
+      sstables_ = old_tables;
+      manifest_->SetCurrentEdit(publish_edit);
+      new_table.reset();
+      cleanup_new_files();
+      return status;
+    }
+
+    if (rebuilt_index != nullptr) {
+      status = index->ReplaceWith(std::move(*rebuilt_index));
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    ++compaction_count_;
   }
 
   for (const auto& table : old_tables) {
@@ -993,9 +1179,18 @@ Status DB::CompactUnlocked() {
       if (!remove_status.ok()) {
         return remove_status;
       }
+      for (const auto& meta : old_metas) {
+        if (meta.file_number == table->FileNumber() &&
+            !meta.index_path.empty()) {
+          remove_status = RemoveFileIfExists(meta.index_path);
+          if (!remove_status.ok()) {
+            return remove_status;
+          }
+          break;
+        }
+      }
     }
   }
-  ++compaction_count_;
   LogEvent("compaction end output SSTable " + std::to_string(new_file_number) +
            " L" + std::to_string(target_level));
   return Status::OK();
@@ -1006,6 +1201,7 @@ DBStats DB::Stats() const {
   DBStats stats;
   stats.sstable_count = sstables_.size();
   stats.compaction_count = compaction_count_;
+  stats.flush_count = flush_count_;
   stats.sstable_full_scans = sstable_full_scans_;
   for (const auto& meta : manifest_->SSTables()) {
     if (meta.level == 0) {
@@ -1027,6 +1223,15 @@ DBStats DB::Stats() const {
     stats.block_restart_seeks += table->RestartSeekCount();
   }
   return stats;
+}
+
+HNSWStats DB::VectorIndexStats() const {
+  std::shared_ptr<HNSWIndex> index;
+  {
+    std::lock_guard<std::mutex> lock(version_mu_);
+    index = vector_index_;
+  }
+  return index == nullptr ? HNSWStats{} : index->Stats();
 }
 
 Status DB::LoadOrRecoverManifest() {
@@ -1123,11 +1328,16 @@ Status DB::OpenSSTables() {
 }
 
 Status DB::AddVectorIndexEntry(const VersionedEntry& entry) {
-  if (vector_index_ == nullptr) {
+  return AddVectorIndexEntryTo(vector_index_, entry);
+}
+
+Status DB::AddVectorIndexEntryTo(const std::shared_ptr<HNSWIndex>& index,
+                                 const VersionedEntry& entry) const {
+  if (index == nullptr) {
     return Status::OK();
   }
   if (entry.deleted || !IsEncodedVectorValue(entry.value)) {
-    return vector_index_->MarkDeleted(entry.key, entry.sequence);
+    return index->MarkDeleted(entry.key, entry.sequence);
   }
 
   VectorRecord record;
@@ -1139,14 +1349,95 @@ Status DB::AddVectorIndexEntry(const VersionedEntry& entry) {
     return Status::Corruption(
         "stored vector dimension does not match configured dimension");
   }
-  return vector_index_->InsertVersion(entry.key, entry.sequence,
-                                      record.vector, record.metadata);
+  return index->InsertVersion(entry.key, entry.sequence, record.vector,
+                              record.metadata);
+}
+
+Status DB::BuildVectorIndexForCompaction(
+    const std::vector<VersionedEntry>& output,
+    const std::set<std::uint64_t>& input_numbers,
+    const std::vector<std::shared_ptr<SSTable>>& tables,
+    std::shared_ptr<HNSWIndex>* rebuilt) const {
+  if (rebuilt == nullptr) {
+    return Status::InvalidArgument("rebuilt HNSW output cannot be null");
+  }
+  rebuilt->reset();
+  if (vector_index_ == nullptr) {
+    return Status::OK();
+  }
+
+  HNSWOptions index_options;
+  index_options.dimension = options_.vector_dimension;
+  index_options.max_neighbors = options_.hnsw_max_neighbors;
+  index_options.ef_construction = options_.hnsw_ef_construction;
+  index_options.metric = options_.vector_distance_metric;
+  auto replacement = std::make_shared<HNSWIndex>(index_options);
+
+  auto add_entries = [&](const std::vector<VersionedEntry>& entries) {
+    for (const auto& entry : entries) {
+      Status status = AddVectorIndexEntryTo(replacement, entry);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    return Status::OK();
+  };
+
+  Status status = add_entries(output);
+  if (!status.ok()) {
+    return status;
+  }
+  for (const auto& table : tables) {
+    if (input_numbers.find(table->FileNumber()) != input_numbers.end()) {
+      continue;
+    }
+    std::vector<VersionedEntry> entries;
+    status = table->Entries(&entries);
+    if (!status.ok()) {
+      return status;
+    }
+    status = add_entries(entries);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  *rebuilt = std::move(replacement);
+  return Status::OK();
 }
 
 Status DB::RebuildVectorIndex() {
   if (vector_index_ == nullptr) {
     return Status::OK();
   }
+
+  // Each SSTable owns a sub-index containing exactly its entries.  Merge the
+  // live sub-indexes in file-number order. Keep the old scan as a compatibility
+  // path for databases created before index persistence was introduced.
+  bool all_tables_have_indexes = true;
+  for (const auto& meta : manifest_->SSTables()) {
+    if (meta.index_path.empty()) {
+      all_tables_have_indexes = false;
+      break;
+    }
+  }
+  if (all_tables_have_indexes && !manifest_->SSTables().empty()) {
+    bool first = true;
+    for (const auto& meta : manifest_->SSTables()) {
+      if (!std::filesystem::exists(meta.index_path)) {
+        return Status::IOError("MANIFEST references missing HNSW index: " +
+                               meta.index_path.string());
+      }
+      Status status = first ? vector_index_->Load(meta.index_path)
+                            : vector_index_->MergeFrom(meta.index_path);
+      first = false;
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    return Status::OK();
+  }
+
   for (const auto& table : sstables_) {
     std::vector<VersionedEntry> entries;
     ++sstable_full_scans_;
@@ -1162,6 +1453,41 @@ Status DB::RebuildVectorIndex() {
     }
   }
   return Status::OK();
+}
+
+Status DB::SaveVectorIndexEntries(
+    const std::vector<VersionedEntry>& entries,
+    const std::filesystem::path& path) const {
+  if (vector_index_ == nullptr) {
+    return Status::OK();
+  }
+  HNSWOptions index_options;
+  index_options.dimension = options_.vector_dimension;
+  index_options.max_neighbors = options_.hnsw_max_neighbors;
+  index_options.ef_construction = options_.hnsw_ef_construction;
+  index_options.metric = options_.vector_distance_metric;
+  HNSWIndex sub_index(index_options);
+  for (const auto& entry : entries) {
+    Status status;
+    if (entry.deleted || !IsEncodedVectorValue(entry.value)) {
+      status = sub_index.MarkDeleted(entry.key, entry.sequence);
+    } else {
+      VectorRecord record;
+      status = DecodeVectorValue(entry.value, &record);
+      if (status.ok() && record.vector.size() != options_.vector_dimension) {
+        status = Status::Corruption(
+            "stored vector dimension does not match configured dimension");
+      }
+      if (status.ok()) {
+        status = sub_index.InsertVersion(entry.key, entry.sequence,
+                                         record.vector, record.metadata);
+      }
+    }
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return sub_index.Save(path);
 }
 
 Status DB::Recover() {
@@ -1340,6 +1666,7 @@ void DB::BackgroundWorkerLoop() {
 
       std::uint64_t oldest_live_wal_after_flush = 0;
       bool cleanup_obsolete_wals = false;
+      bool run_compaction = false;
       {
         std::unique_lock<std::mutex> lock(version_mu_);
         if (!status.ok()) {
@@ -1374,15 +1701,19 @@ void DB::BackgroundWorkerLoop() {
         }
 
         immutable_memtables_.pop_front();
+        ++flush_count_;
         oldest_live_wal_after_flush = next_live_wal;
         cleanup_obsolete_wals = true;
+        run_compaction = true;
+      }
 
+      if (run_compaction) {
         status = MaybeCompact();
         if (!status.ok()) {
+          std::lock_guard<std::mutex> lock(version_mu_);
           SetBackgroundErrorLocked(status);
         }
       }
-
       if (cleanup_obsolete_wals) {
         status = RemoveObsoleteWALFiles(oldest_live_wal_after_flush);
         if (!status.ok()) {
@@ -1418,8 +1749,18 @@ Status DB::FlushImmutableMemTable(const ImmutableMemTable& immutable,
     return status;
   }
 
+  const std::filesystem::path index_path = HNSWIndexPath(sstable_number);
+  if (vector_index_ != nullptr) {
+    status = SaveVectorIndexEntries(entries, index_path);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
   meta->file_number = (*table)->FileNumber();
   meta->file_path = (*table)->FilePath();
+  meta->index_path = vector_index_ == nullptr ? std::filesystem::path{}
+                                              : index_path;
   meta->level = 0;
   std::error_code ec;
   meta->file_size = std::filesystem::file_size(meta->file_path, ec);
@@ -1440,21 +1781,26 @@ void DB::SetBackgroundErrorLocked(Status status) {
 }
 
 Status DB::MaybeCompact() {
+  std::lock_guard<std::mutex> compaction_lock(compaction_mu_);
   for (int attempts = 0; attempts < 4; ++attempts) {
     size_t level0_count = 0;
     std::uint64_t level1_size = 0;
-    for (const auto& meta : manifest_->SSTables()) {
-      if (meta.level == 0) {
-        ++level0_count;
-      } else if (meta.level == 1) {
-        level1_size += meta.file_size;
+    {
+      std::lock_guard<std::mutex> lock(version_mu_);
+      if (closed_) {
+        return Status::OK();
+      }
+      for (const auto& meta : manifest_->SSTables()) {
+        if (meta.level == 0) {
+          ++level0_count;
+        } else if (meta.level == 1) {
+          level1_size += meta.file_size;
+        }
       }
     }
 
-    const std::uint64_t level1_size_limit =
-        static_cast<std::uint64_t>(options_.memtable_entries_limit) * 64;
     if (level0_count > options_.level0_sstable_limit ||
-        level1_size > level1_size_limit) {
+        level1_size > options_.level1_size_limit_bytes) {
       Status status = CompactUnlocked();
       if (!status.ok()) {
         return status;
@@ -1557,6 +1903,10 @@ void DB::LogEvent(const std::string& message) const {
 
 std::filesystem::path DB::SSTablePath(std::uint64_t number) const {
   return options_.db_path / SSTableFileName(number);
+}
+
+std::filesystem::path DB::HNSWIndexPath(std::uint64_t number) const {
+  return options_.db_path / HNSWIndexFileName(number);
 }
 
 std::filesystem::path DB::WALPath(std::uint64_t number) const {

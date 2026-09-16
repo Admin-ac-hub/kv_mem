@@ -120,6 +120,10 @@ std::string SSTableFileName(std::uint64_t number) {
   return NumberedName("sst_", number, ".data");
 }
 
+std::string HNSWIndexFileName(std::uint64_t number) {
+  return NumberedName("index_", number, ".hnsw");
+}
+
 std::string WALFileName(std::uint64_t number) {
   return NumberedName("wal_", number, ".log");
 }

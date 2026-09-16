@@ -1,0 +1,23 @@
+i.i.d. Gaussian | n=20000 dim=768 M=16 ef_c=200 | nodes=20000 max_level=3 directed_edges=399542 max_degree=32 avg_degree=20.0
+    build_seconds=51.444 queries=100
+    in_distribution ef=16   recall@10=0.3140 duplicate_keys=0 qps=3445.2
+    in_distribution ef=32   recall@10=0.4610 duplicate_keys=0 qps=2208.2
+    in_distribution ef=64   recall@10=0.6040 duplicate_keys=0 qps=1387.4
+    in_distribution ef=128  recall@10=0.7650 duplicate_keys=0 qps=796.7
+    in_distribution ef=256  recall@10=0.8770 duplicate_keys=0 qps=454.8
+    in_distribution ef=512  recall@10=0.9460 duplicate_keys=0 qps=285.4
+clustered | n=20000 dim=768 M=16 ef_c=200 | nodes=20000 max_level=3 directed_edges=263312 max_degree=32 avg_degree=13.2
+    build_seconds=12.419 queries=100
+    in_distribution ef=16   recall@10=0.9800 duplicate_keys=0 qps=8422.6
+    in_distribution ef=32   recall@10=0.9990 duplicate_keys=0 qps=6962.7
+    in_distribution ef=64   recall@10=1.0000 duplicate_keys=0 qps=6135.0
+    in_distribution ef=128  recall@10=1.0000 duplicate_keys=0 qps=2987.0
+    in_distribution ef=256  recall@10=1.0000 duplicate_keys=0 qps=1690.9
+    in_distribution ef=512  recall@10=1.0000 duplicate_keys=0 qps=847.3
+    independent_centers_OOD ef=16   recall@10=0.4160 duplicate_keys=0 qps=7080.8
+    independent_centers_OOD ef=32   recall@10=0.5030 duplicate_keys=0 qps=5268.2
+    independent_centers_OOD ef=64   recall@10=0.5320 duplicate_keys=0 qps=4054.4
+    independent_centers_OOD ef=128  recall@10=0.7460 duplicate_keys=0 qps=2219.2
+    independent_centers_OOD ef=256  recall@10=0.8700 duplicate_keys=0 qps=1501.5
+    independent_centers_OOD ef=512  recall@10=0.9600 duplicate_keys=0 qps=923.9
+Recall@10 regression: expected >0.95 at ef=512

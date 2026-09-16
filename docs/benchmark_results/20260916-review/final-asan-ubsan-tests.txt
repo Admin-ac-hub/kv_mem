@@ -1,0 +1,21 @@
+Test project /Users/ys/cppProject/KV/build-review-asan
+    Start 1: kv_test
+1/6 Test #1: kv_test ..........................   Passed   10.94 sec
+    Start 2: hnsw_test
+2/6 Test #2: hnsw_test ........................   Passed    3.57 sec
+    Start 3: week5_bench_sync_smoke
+3/6 Test #3: week5_bench_sync_smoke ...........   Passed    0.44 sec
+    Start 4: vector_bench_maintenance
+4/6 Test #4: vector_bench_maintenance .........   Passed    0.64 sec
+    Start 5: vector_bench_smoke
+5/6 Test #5: vector_bench_smoke ...............   Passed    0.22 sec
+    Start 6: kv_stress_fixed_seed
+6/6 Test #6: kv_stress_fixed_seed .............   Passed    0.63 sec
+
+100% tests passed, 0 tests failed out of 6
+
+Label Time Summary:
+benchmark    =   1.30 sec*proc (3 tests)
+stress       =   0.63 sec*proc (1 test)
+
+Total Test time (real) =  16.46 sec

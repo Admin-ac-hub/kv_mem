@@ -1,0 +1,19 @@
+repeat=1 command=/Users/ys/cppProject/KV/build-review-scalar/hnsw_recall_probe insert 5000 768 16 200
+distance_backend=scalar
+n=5000 dim=768 M=16 ef_c=200 | insert 12.02s -> 416.0 inserts/s (2404 us/insert)
+repeat=1 command=/Users/ys/cppProject/KV/build-review-fixes/hnsw_recall_probe insert 5000 768 16 200
+distance_backend=neon
+n=5000 dim=768 M=16 ef_c=200 | insert 5.06s -> 987.5 inserts/s (1013 us/insert)
+repeat=2 command=/Users/ys/cppProject/KV/build-review-scalar/hnsw_recall_probe insert 5000 768 16 200
+distance_backend=scalar
+n=5000 dim=768 M=16 ef_c=200 | insert 13.19s -> 379.0 inserts/s (2639 us/insert)
+repeat=2 command=/Users/ys/cppProject/KV/build-review-fixes/hnsw_recall_probe insert 5000 768 16 200
+distance_backend=neon
+n=5000 dim=768 M=16 ef_c=200 | insert 7.72s -> 647.9 inserts/s (1543 us/insert)
+repeat=3 command=/Users/ys/cppProject/KV/build-review-scalar/hnsw_recall_probe insert 5000 768 16 200
+distance_backend=scalar
+n=5000 dim=768 M=16 ef_c=200 | insert 13.70s -> 365.0 inserts/s (2740 us/insert)
+repeat=3 command=/Users/ys/cppProject/KV/build-review-fixes/hnsw_recall_probe insert 5000 768 16 200
+distance_backend=neon
+n=5000 dim=768 M=16 ef_c=200 | insert 5.19s -> 962.5 inserts/s (1039 us/insert)
+{"rates": {"scalar": [416.0, 379.0, 365.0], "neon": [987.5, 647.9, 962.5]}, "median_inserts_per_second": {"scalar": 379.0, "neon": 962.5}, "median_speedup": 2.5395778364116093}

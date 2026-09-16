@@ -18,7 +18,7 @@ Mini LSM-KV 是一个基于 C++17 实现的单机持久化 KV 存储引擎。项
 | Compaction | 简化 L0/L1/L2 leveled compaction，处理重叠范围、历史版本和 tombstone |
 | 数据校验 | WAL record、Manifest record 和 SSTable DataBlock CRC32 校验 |
 | 向量存储 | Float32 固定维度向量、JSON metadata、L2/IP/Cosine 精确 Top-K 基线 |
-| ANN 索引 | 内存 HNSW、增量插入、分层 beam search、可配置 `M`/`ef` |
+| ANN 索引 | HNSW、连续向量布局、AVX2 / AArch64 NEON 距离加速、单次读锁批量查询、可配置 `M`/`ef` |
 | 工程验证 | 单元测试、并发随机压力测试、ASan/UBSan/TSan CI、可复现 benchmark |
 
 ### 向量存储（第一阶段）
@@ -40,8 +40,14 @@ L2 返回欧氏距离，Inner Product 返回负内积，Cosine 返回 `1 - cosin
 `ef_search` 控制召回率与延迟的权衡。插入使用独占锁，查询使用共享锁。
 
 固定种子的 `1000 x 128` 测试会以精确搜索为基线验证 `Recall@10 > 0.90`，
-并检查平均查询延迟低于 1 ms。`DB::Search` 已接入内存 HNSW，并在查询阶段按
-LSM 的最新版本、tombstone 和 snapshot 过滤结果；索引持久化仍属于后续阶段。
+并检查平均查询延迟低于 1 ms。`DB::Search` 已接入 HNSW，并在查询阶段按
+LSM 的最新版本、tombstone 和 snapshot 过滤结果。Flush/Compaction 会生成带 CRC32
+校验的 HNSW 子索引，Manifest 记录索引路径，重启时按 SSTable 顺序加载并合并。
+
+Compaction 采用两阶段发布：先固定输入 SSTable，在不持有全局版本锁的情况下
+归并数据并构建替换索引，此时查询继续使用旧索引；发布前短暂持锁，补入构建期间
+新增的 SSTable 和 MemTable 版本，持久化 Manifest 后原子替换内存图。旧 SSTable
+与索引文件只在新版本发布成功后删除。
 
 ## 系统架构
 
@@ -234,6 +240,17 @@ docker run --rm mini-lsm-kv-stress
 
 ## Benchmark
 
+向量正式验收尚未完成，路线图目标不是实测指标。向量 benchmark 默认保留
+正常的 1024 条 MemTable、64 MiB L1 字节预算和 block cache，并打印实际
+flush/compaction 次数；写入吞吐包含 Close 时的后台收尾。复现方式与批量延迟
+口径见 [向量 Benchmark 报告](docs/WEEK6_BENCHMARK_REPORT.md)。
+
+HNSW 的 `M` 限制上层邻居数，level 0 上限为 `2*M`。索引保存使用 v2 格式，
+可读取旧 v1 文件；旧程序不能读取新的 v2 文件。`DB::VectorIndexStats()` 提供
+图统计（O(节点数 + 边数)）；`Options::level1_size_limit_bytes` 独立配置 L1 预算。
+大规模召回回归可通过 `-DKV_ENABLE_RECALL_REGRESSION=ON` 启用，再运行
+`ctest --test-dir <build目录> -L recall --output-on-failure`。这仍不能替代百万规模验收。
+
 Benchmark 覆盖写入、顺序读、随机读、范围扫描和混合读写 workload，输出以下指标：
 
 - QPS 与平均延迟
@@ -253,6 +270,17 @@ workload 定义、指标解释和结果分析见 [docs/BENCHMARK_ANALYSIS.md](do
 第五周的同步、批处理和 Sanitizer 实验见
 [docs/WEEK5_PERFORMANCE_REPORT.md](docs/WEEK5_PERFORMANCE_REPORT.md)，可用
 `./scripts/run_week5_experiment.sh` 重现 CSV 数据。
+
+向量工作负载的 Week 6 benchmark 覆盖百万级写入、千次随机查询和 50/50
+混合读写，默认维度为 768。它会输出吞吐、P50/P99、精确 Recall@10 抽样和
+SSTable/HNSW 文件大小：
+
+```bash
+./scripts/run_week6_benchmark.sh
+```
+
+完整方法、开发机基线和正式 1M x 768 复现实验见
+[docs/WEEK6_BENCHMARK_REPORT.md](docs/WEEK6_BENCHMARK_REPORT.md)。
 
 ## API 概览
 
@@ -310,17 +338,20 @@ int main() {
 ```
 
 主要接口包括 `Open`、`Close`、`Write`、`Put`、`Get`、`PutVector`、
-`GetVector`、`BruteForceSearch`、`Search`、`Delete`、`Compact`、`Stats`、
-`GetSnapshot` 和 `NewIterator`。
+`GetVector`、`BruteForceSearch`、`Search`、`SearchBatch`、`Delete`、`Compact`、`Stats`、
+`VectorIndexStats`、`GetSnapshot` 和 `NewIterator`。
 
 ## 当前边界
 
 - 单进程存储引擎，同一路径不支持多个 `DB` 实例并发写入。
 - Compaction 尚未实现完整的 level score、grandparent overlap 控制和多文件输出切分。
 - Compaction 输入端已流式归并，输出端仍会先构建内存 vector 再生成 SSTable。
+- HNSW Compaction 当前构建完整替换索引，尚未实现只更新变化节点的增量算法。
+- HNSW 插入由独占锁串行执行；Flush 子索引和 Compaction 重建仍有重复构图成本。
+- metadata 预过滤、范围与向量组合、分数融合及完整的引擎查询/插入指标尚未实现。
 - 每个 WriteBatch 默认执行一次 WAL fsync，尚未实现 writer queue、group commit 和可配置 durability。
 - DataBlock 已保留编码类型，但当前只写入原始 payload，尚未接入 Snappy 或 Zstd。
-- HNSW 当前仅为内存索引；LSM 多版本、tombstone 和并发查询已接入，索引文件持久化与重启加载尚未实现。
+- HNSW 子索引会随 SSTable Flush/Compaction 持久化；重启时优先加载并合并已发布的索引文件，老版本数据库仍可通过 SSTable 全量重建。
 
 ## 后续方向
 
@@ -329,4 +360,3 @@ int main() {
 - 实现 writer queue、group commit 与可配置同步策略。
 - 接入 Snappy/Zstd，对比压缩率、CPU 开销与缓存命中率。
 - 增加进程异常退出、I/O 故障注入和长时间稳定性测试。
-- 在 Flush/Compaction 时持久化或重建 HNSW 索引，并补充索引文件恢复。
