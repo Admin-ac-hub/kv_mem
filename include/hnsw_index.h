@@ -22,7 +22,7 @@ struct HNSWOptions {
   size_t max_neighbors = 16;
   size_t ef_construction = 200;
   VectorDistanceMetric metric = VectorDistanceMetric::kL2;
-  std::uint64_t random_seed = 0x48534e57ULL;
+  std::uint64_t random_seed = 0x48534e57ULL;//"HNSW"的ASCII
 };
 
 struct HNSWStats {
