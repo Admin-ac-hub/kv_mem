@@ -43,7 +43,7 @@ OPERATIONS=100000 SYNC_OPERATIONS=5000000 SYNC_THREADS=1 BATCH_SIZE=32 VALUE_SIZ
 | 模式 | ns/op | ops/s | lock-free | 说明 |
 | --- | ---: | ---: | --- | --- |
 | `mutex` | 4.05 | 247.21 M | false | 每次递增都进入互斥锁临界区 |
-| `atomic` | 1.60 | 626.56 M | true | `fetch_add(relaxed)`；运行时检查 `is_lock_free()` |
+| `atomic` | 1.60 | 626.56 M | true | `fetch_add(relaxed)`；编译期查询 `is_always_lock_free` |
 | `batched-mutex` | 0.37 | 2.68 B | false | 每 32 次递增合并一次锁内更新 |
 
 在这个无争用、纯内存计数器上，atomic 约为 mutex 的 2.5 倍；批量合并临界区

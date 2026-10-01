@@ -166,8 +166,10 @@ int RunSyncBench(const Args& args) {
         }
       });
   atomic_result.counter = atomic_counter.load(std::memory_order_relaxed);
+  // Use the compile-time constant: the runtime is_lock_free() lowers to
+  // libatomic's __atomic_is_lock_free, which clang does not link implicitly.
   PrintSyncResult("atomic", args, atomic_result,
-                  atomic_counter.is_lock_free());
+                  std::atomic<std::uint64_t>::is_always_lock_free);
 
   std::mutex batched_mutex;
   std::uint64_t batched_counter = 0;
