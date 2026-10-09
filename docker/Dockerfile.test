@@ -1,0 +1,32 @@
+# Toolchain image for building and testing this repository entirely inside a
+# container. The host is macOS arm64, so the container is linux/arm64 and the
+# distance kernel resolves to the NEON backend. That matters for benchmark
+# numbers: an x86_64 container would select AVX2 instead and is not comparable.
+#
+# Usage (build once, then reuse the named build volume for incremental builds):
+#   docker build -f docker/Dockerfile.test -t kv-test:ubuntu24 .
+#   docker run --rm -v "$PWD":/src:ro -v kv-test-build:/work -w /work \
+#       kv-test:ubuntu24 bash -lc \
+#       'cmake -S /src -B /work -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#              -DBUILD_TESTING=ON && cmake --build /work --parallel'
+#
+# scripts/docker_test.sh wraps the above.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential \
+       ca-certificates \
+       cmake \
+       ninja-build \
+       python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# A fixed working directory for out-of-tree builds; /src is bind-mounted at run
+# time so the image does not need to be rebuilt when sources change.
+WORKDIR /work
+
+CMD ["/bin/bash"]

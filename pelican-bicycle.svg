@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 700" role="img" aria-labelledby="title desc">
+  <title id="title">鹈鹕在海边骑自行车</title>
+  <desc id="desc">一只白色鹈鹕骑着蓝色自行车，沿着明亮的海岸前行。</desc>
+  <defs>
+    <linearGradient id="sky" x2="0" y2="1">
+      <stop stop-color="#b8e8ef"/>
+      <stop offset="1" stop-color="#e9f5df"/>
+    </linearGradient>
+    <linearGradient id="sea" x2="0" y2="1">
+      <stop stop-color="#36b9c3"/>
+      <stop offset="1" stop-color="#16889b"/>
+    </linearGradient>
+    <linearGradient id="sand" x2="0" y2="1">
+      <stop stop-color="#f4d998"/>
+      <stop offset="1" stop-color="#eabf78"/>
+    </linearGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feGaussianBlur stdDeviation="8"/>
+    </filter>
+  </defs>
+
+  <!-- Coastal sky and distant water -->
+  <rect width="1000" height="700" fill="url(#sky)"/>
+  <circle cx="810" cy="112" r="54" fill="#ffd46e"/>
+  <g fill="#fffdf5" opacity=".9">
+    <path d="M130 139c8-23 42-29 58-8 20-16 49-3 49 20H119c-12-5-8-12 11-12z"/>
+    <path d="M690 204c7-18 33-23 46-7 16-13 39-2 39 16h-93c-9-4-7-9 8-9z"/>
+  </g>
+  <path d="M0 300c115-28 178 19 293 0s185-34 292-3 180 25 261-1 120-13 154-5v235H0z" fill="url(#sea)"/>
+  <path d="M0 354c94-19 145 16 232 0s142-24 227-2 147 19 220 0 122-17 192-2 98 9 129 3" fill="none" stroke="#a7e4dc" stroke-width="7" stroke-linecap="round" opacity=".85"/>
+  <path d="M35 430c74-13 112 12 183 0m383-20c80-15 123 11 196-2m-131 63c62-11 94 9 154-2" fill="none" stroke="#d5f1e4" stroke-width="5" stroke-linecap="round" opacity=".75"/>
+  <path d="M0 504c163-18 261 10 408 0s249-17 361 0 166 4 231-3v199H0z" fill="url(#sand)"/>
+  <path d="M0 508c147-16 250 14 408 2s251-14 361 1 166 5 231-2" fill="none" stroke="#fff2cb" stroke-width="10" opacity=".9"/>
+  <g fill="#fff3d0" opacity=".7">
+    <circle cx="106" cy="581" r="3"/><circle cx="178" cy="632" r="2.5"/><circle cx="858" cy="586" r="3"/>
+    <circle cx="763" cy="652" r="2.5"/><circle cx="923" cy="619" r="2"/><circle cx="245" cy="557" r="2"/>
+  </g>
+
+  <!-- Ground shadow -->
+  <ellipse cx="501" cy="619" rx="294" ry="18" fill="#836b49" opacity=".2" filter="url(#softShadow)"/>
+
+  <!-- Bicycle wheels -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="300" cy="520" r="92" stroke="#263f50" stroke-width="12"/>
+    <circle cx="700" cy="520" r="92" stroke="#263f50" stroke-width="12"/>
+    <circle cx="300" cy="520" r="6" fill="#f2f6e9" stroke="#263f50" stroke-width="5"/>
+    <circle cx="700" cy="520" r="6" fill="#f2f6e9" stroke="#263f50" stroke-width="5"/>
+    <g stroke="#8ba2a1" stroke-width="3" opacity=".9">
+      <path d="M300 428v184M208 520h184M235 455l130 130m0-130L235 585"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 300 520" to="360 300 520" dur="0.42s" repeatCount="indefinite"/>
+    </g>
+    <g stroke="#8ba2a1" stroke-width="3" opacity=".9">
+      <path d="M700 428v184M608 520h184M635 455l130 130m0-130L635 585"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 700 520" to="360 700 520" dur="0.42s" repeatCount="indefinite"/>
+    </g>
+    <path d="M300 520l132-116 71 116H300l200 0 113-116 87 116" stroke="#167f96" stroke-width="13"/>
+    <path d="M432 404l-19-25m-20 0h42m251 5-3-20m-24 0h49" stroke="#263f50" stroke-width="9"/>
+    <g stroke="#263f50" stroke-width="8">
+      <path d="M500 520v-34m0 34v34"/>
+      <path d="M484 486h32m-32 68h32" stroke-width="7"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 500 520" to="360 500 520" dur="1.2s" repeatCount="indefinite"/>
+    </g>
+    <circle cx="500" cy="520" r="13" fill="#f2b544" stroke="#263f50" stroke-width="5"/>
+    <path d="M606 405l23-26m-16 27-24-5m42 4 22-5" stroke="#263f50" stroke-width="8"/>
+    <path d="M247 443a92 92 0 0 1 109-10m291 0a92 92 0 0 1 109 10" stroke="#f5f7e9" stroke-width="5" opacity=".9"/>
+  </g>
+
+  <!-- Pelican body, perched over the saddle -->
+  <path d="M386 375c17-34 66-47 109-31 34 13 51 47 34 78-14 26-55 43-99 32-47-11-65-46-44-79z" fill="#fffdf5" stroke="#d7e5dc" stroke-width="4"/>
+  <path d="M402 386c18-20 57-27 84-12 15 9 22 25 18 41-24 16-56 21-82 11-18-7-27-22-20-40z" fill="#f1f6ed"/>
+  <path d="M432 356c-1-37 19-78 54-93 19-8 41 0 45 18 4 18-11 32-24 42-14 12-15 27-7 46" fill="none" stroke="#fffdf5" stroke-width="29" stroke-linecap="round"/>
+  <path d="M432 356c-1-37 19-78 54-93 19-8 41 0 45 18 4 18-11 32-24 42-14 12-15 27-7 46" fill="none" stroke="#d7e5dc" stroke-width="3" stroke-linecap="round"/>
+  <ellipse cx="528" cy="266" rx="28" ry="24" fill="#fffdf5" stroke="#d7e5dc" stroke-width="3"/>
+  <path d="M543 265c42-7 98 1 153 15-50 13-103 17-154 3z" fill="#f2a143" stroke="#d37e34" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M546 278c31 18 76 22 126 2-14 42-69 65-111 36-12-8-18-21-15-38z" fill="#f08c45" stroke="#d37e34" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M567 292c27 15 58 15 86 1" fill="none" stroke="#ffd08a" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="536" cy="259" r="4.5" fill="#263f50"/>
+  <circle cx="537" cy="258" r="1.5" fill="#fff"/>
+  <path d="M410 389c-17 9-27 24-22 37 15-4 27-16 32-30m69 20c-17 5-28 18-27 31 16 0 29-9 37-22" fill="#fffdf5" stroke="#d7e5dc" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- Alternating legs stay attached to opposite pedals throughout the cycle. -->
+  <g fill="none" stroke="#e58c39" stroke-width="9" stroke-linecap="round">
+    <path d="M447 420 Q462 437 475 455">
+      <animate attributeName="d" dur="1.2s" repeatCount="indefinite" keyTimes="0;.125;.25;.375;.5;.625;.75;.875;1" values="M447 420 Q462 437 475 455;M447 420 Q466 439 482 458;M447 420 Q468 442 490 470;M447 420 Q469 449 490 480;M447 420 Q464 458 480 490;M447 420 Q459 450 475 480;M447 420 Q460 445 475 470;M447 420 Q461 437 475 460;M447 420 Q462 437 475 455"/>
+    </path>
+    <path d="M475 455 Q488 470 500 486">
+      <animate attributeName="d" dur="1.2s" repeatCount="indefinite" keyTimes="0;.125;.25;.375;.5;.625;.75;.875;1" values="M475 455 Q488 470 500 486;M482 458 Q503 478 524 496;M490 470 Q512 493 534 520;M490 480 Q509 512 524 544;M480 490 Q490 520 500 554;M475 480 Q475 512 476 544;M475 470 Q470 494 466 520;M475 460 Q473 477 476 496;M475 455 Q488 470 500 486"/>
+    </path>
+    <path d="M482 420 Q501 448 520 490">
+      <animate attributeName="d" dur="1.2s" repeatCount="indefinite" keyTimes="0;.125;.25;.375;.5;.625;.75;.875;1" values="M482 420 Q501 448 520 490;M482 420 Q501 447 514 480;M482 420 Q493 445 505 470;M482 420 Q482 442 482 460;M482 420 Q478 437 475 455;M482 420 Q482 440 478 458;M482 420 Q491 442 490 470;M482 420 Q504 457 510 480;M482 420 Q501 448 520 490"/>
+    </path>
+    <path d="M520 490 Q510 520 500 554">
+      <animate attributeName="d" dur="1.2s" repeatCount="indefinite" keyTimes="0;.125;.25;.375;.5;.625;.75;.875;1" values="M520 490 Q510 520 500 554;M514 480 Q494 512 476 544;M505 470 Q484 494 466 520;M482 460 Q480 478 476 496;M475 455 Q488 470 500 486;M478 458 Q500 477 524 496;M490 470 Q510 494 534 520;M510 480 Q519 514 524 544;M520 490 Q510 520 500 554"/>
+    </path>
+  </g>
+  <g fill="#e58c39" stroke="#cf7f36" stroke-width="2">
+    <circle cx="475" cy="455" r="6">
+      <animate attributeName="cx" dur="1.2s" repeatCount="indefinite" keyTimes="0;.125;.25;.375;.5;.625;.75;.875;1" values="475;482;490;490;480;475;475;475;475"/>
+      <animate attributeName="cy" dur="1.2s" repeatCount="indefinite" keyTimes="0;.125;.25;.375;.5;.625;.75;.875;1" values="455;458;470;480;490;480;470;460;455"/>
+    </circle>
+    <circle cx="520" cy="490" r="6">
+      <animate attributeName="cx" dur="1.2s" repeatCount="indefinite" keyTimes="0;.125;.25;.375;.5;.625;.75;.875;1" values="520;514;505;482;475;478;490;510;520"/>
+      <animate attributeName="cy" dur="1.2s" repeatCount="indefinite" keyTimes="0;.125;.25;.375;.5;.625;.75;.875;1" values="490;480;470;460;455;458;470;480;490"/>
+    </circle>
+  </g>
+  <!-- The webbed feet turn with their pedals, so they never slide off. -->
+  <g fill="#f3a548" stroke="#cf7f36" stroke-width="3" stroke-linejoin="round">
+    <path d="M484 480c8-7 23-7 32 0-5 4-11 5-16 3-5 5-13 6-19 2z">
+      <animateTransform attributeName="transform" type="rotate" from="0 500 520" to="360 500 520" dur="1.2s" repeatCount="indefinite"/>
+    </path>
+    <path d="M484 548c8-7 23-7 32 0-5 4-11 5-16 3-5 5-13 6-19 2z">
+      <animateTransform attributeName="transform" type="rotate" from="0 500 520" to="360 500 520" dur="1.2s" repeatCount="indefinite"/>
+    </path>
+  </g>
+
+  <!-- Small coastal grasses -->
+  <g fill="none" stroke="#718d59" stroke-width="5" stroke-linecap="round">
+    <path d="M112 535c-7-20-7-35-3-49m5 50c7-21 16-33 28-42m-32 42c-13-14-22-22-35-25"/>
+    <path d="M874 535c-5-19-4-34 1-47m0 47c9-17 20-28 32-34m-32 34c-12-12-23-18-34-19"/>
+  </g>
+  <g fill="#f5b45f">
+    <circle cx="111" cy="483" r="4"/><circle cx="147" cy="492" r="4"/><circle cx="75" cy="509" r="4"/>
+    <circle cx="876" cy="487" r="4"/><circle cx="909" cy="499" r="4"/><circle cx="841" cy="516" r="4"/>
+  </g>
+</svg>

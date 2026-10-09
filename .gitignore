@@ -19,6 +19,7 @@ test/test_dbs/
 
 # Locally built diagnostic tools (source lives in tools/)
 /tools/hnsw_recall_probe
+/tools/hnsw_partition_probe
 
 # Agent scratch space
 .workbuddy-ai/

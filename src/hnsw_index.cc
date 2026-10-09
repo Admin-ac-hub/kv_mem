@@ -6,7 +6,6 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
-#include <queue>
 #include <string_view>
 #include <utility>
 
@@ -79,195 +78,26 @@ Status ReadString(std::string_view input,
 
 }  // namespace
 
-bool HNSWIndex::CandidateIsBetter(const Candidate& lhs,
-                                  const Candidate& rhs) {
-  if (lhs.distance != rhs.distance) {
-    return lhs.distance < rhs.distance;
-  }
-  return lhs.id < rhs.id;
-}
-
-bool HNSWIndex::CandidateMinHeap::operator()(const Candidate& lhs,
-                                             const Candidate& rhs) const {
-  return CandidateIsBetter(rhs, lhs);
-}
-
-bool HNSWIndex::CandidateMaxHeap::operator()(const Candidate& lhs,
-                                             const Candidate& rhs) const {
-  return CandidateIsBetter(lhs, rhs);
-}
-
 HNSWIndex::HNSWIndex(HNSWOptions options)
-    : options_(std::move(options)), random_(options_.random_seed) {
-  if (options_.max_neighbors > 1) {
-    level_multiplier_ = 1.0 / std::log(
-        static_cast<double>(options_.max_neighbors));
-  }
+    : options_(std::move(options)), graph_(options_) {}
+
+bool HNSWIndex::SequenceVisibility::IsVisible(HNSWNodeId node_id,
+                                              const std::string& key) const {
+  return index_->IsVisibleAt(node_id, key, read_sequence_);
 }
 
-Status HNSWIndex::ValidateOptions() const {
-  if (options_.dimension == 0) {
-    return Status::InvalidArgument("HNSW dimension must be greater than zero");
-  }
-  if (options_.max_neighbors < 2) {
-    return Status::InvalidArgument(
-        "HNSW max_neighbors must be at least two");
-  }
-  if (options_.ef_construction == 0) {
-    return Status::InvalidArgument(
-        "HNSW ef_construction must be greater than zero");
-  }
-  if (options_.dimension > std::numeric_limits<std::uint32_t>::max() ||
-      options_.max_neighbors > std::numeric_limits<std::uint32_t>::max() / 2 ||
-      options_.ef_construction > std::numeric_limits<std::uint32_t>::max()) {
-    return Status::InvalidArgument("HNSW options exceed file format limits");
-  }
-  switch (options_.metric) {
-    case VectorDistanceMetric::kL2:
-    case VectorDistanceMetric::kInnerProduct:
-    case VectorDistanceMetric::kCosine:
-      break;
-    default:
-      return Status::InvalidArgument("unknown HNSW distance metric");
-  }
-  return Status::OK();
-}
+Status HNSWIndex::ValidateOptions() const { return graph_.ValidateOptions(); }
 
 Status HNSWIndex::ValidateVector(const std::vector<float>& vector) const {
-  if (vector.size() != options_.dimension) {
-    return Status::InvalidArgument(
-        "vector dimension does not match HNSW dimension");
-  }
-  bool has_nonzero_value = false;
-  for (float value : vector) {
-    if (!std::isfinite(value)) {
-      return Status::InvalidArgument("vector values must be finite");
-    }
-    has_nonzero_value = has_nonzero_value || value != 0.0f;
-  }
-  if (options_.metric == VectorDistanceMetric::kCosine &&
-      !has_nonzero_value) {
-    return Status::InvalidArgument(
-        "cosine distance is undefined for a zero vector");
-  }
-  return Status::OK();
+  return graph_.ValidateVector(vector);
 }
 
-int HNSWIndex::SelectLevel() {
-  std::uniform_real_distribution<double> distribution(
-      std::numeric_limits<double>::min(), 1.0);
-  const double sample = distribution(random_);
-  const double level = -std::log(sample) * level_multiplier_;
-  return std::min(static_cast<int>(level), kMaximumRandomLevel);
-}
-
-float HNSWIndex::Distance(const float* lhs, const float* rhs) const {
-  return ComputeVectorDistanceUnchecked(lhs, rhs, options_.dimension,
-                                        options_.metric);
-}
-
-const float* HNSWIndex::VectorData(NodeId node_id) const {
-  return vector_data_.data() + nodes_[node_id].vector_offset;
-}
-
-bool HNSWIndex::VectorEquals(NodeId node_id,
-                             const std::vector<float>& vector) const {
-  const float* stored = VectorData(node_id);
-  return std::equal(vector.begin(), vector.end(), stored);
-}
-
-std::vector<HNSWIndex::Candidate> HNSWIndex::SearchLayer(
-    const std::vector<float>& query,
-    const std::vector<NodeId>& entry_points,
-    size_t ef,
-    int level,
-    const SequenceNumber* read_sequence) const {
-  if (ef == 0 || level < 0) {
-    return {};
-  }
-  std::priority_queue<Candidate, std::vector<Candidate>, CandidateMinHeap>
-      candidates;
-  std::priority_queue<Candidate, std::vector<Candidate>, CandidateMaxHeap>
-      nearest;
-  // Keep the marker array per thread; each layer needs a fresh generation but
-  // does not need to allocate or clear O(node_count) bits on every query.
-  thread_local std::vector<std::uint32_t> visit_marks;
-  thread_local std::uint32_t visit_generation = 0;
-  if (visit_marks.size() < nodes_.size()) {
-    visit_marks.resize(nodes_.size(), 0);
-  }
-  if (++visit_generation == 0) {
-    std::fill(visit_marks.begin(), visit_marks.end(), 0);
-    visit_generation = 1;
-  }
-  const auto visited = [&](NodeId node_id) {
-    return visit_marks[node_id] == visit_generation;
-  };
-  const auto mark_visited = [&](NodeId node_id) {
-    visit_marks[node_id] = visit_generation;
-  };
-
-  for (NodeId entry : entry_points) {
-    if (entry >= nodes_.size() || visited(entry) ||
-        level >= static_cast<int>(nodes_[entry].neighbors.size())) {
-      continue;
-    }
-    mark_visited(entry);
-    Candidate candidate{Distance(query.data(), VectorData(entry)), entry};
-    candidates.push(candidate);
-    if (read_sequence == nullptr || IsVisible(entry, *read_sequence)) {
-      nearest.push(candidate);
-      if (nearest.size() > ef) {
-        nearest.pop();
-      }
-    }
-  }
-
-  while (!candidates.empty()) {
-    const Candidate current = candidates.top();
-    if (nearest.size() >= ef &&
-        current.distance > nearest.top().distance) {
-      break;
-    }
-    candidates.pop();
-
-    for (NodeId neighbor : nodes_[current.id].neighbors[level]) {
-      if (neighbor >= nodes_.size() || visited(neighbor) ||
-          level >= static_cast<int>(nodes_[neighbor].neighbors.size())) {
-        continue;
-      }
-      mark_visited(neighbor);
-      Candidate candidate{Distance(query.data(), VectorData(neighbor)), neighbor};
-      if (nearest.size() < ef ||
-          CandidateIsBetter(candidate, nearest.top())) {
-        candidates.push(candidate);
-        if (read_sequence == nullptr || IsVisible(neighbor, *read_sequence)) {
-          nearest.push(candidate);
-          if (nearest.size() > ef) {
-            nearest.pop();
-          }
-        }
-      }
-    }
-  }
-
-  std::vector<Candidate> result;
-  result.reserve(nearest.size());
-  while (!nearest.empty()) {
-    result.push_back(nearest.top());
-    nearest.pop();
-  }
-  std::sort(result.begin(), result.end(), CandidateIsBetter);
-  return result;
-}
-
-bool HNSWIndex::IsVisible(NodeId node_id,
-                          SequenceNumber read_sequence) const {
-  if (node_id >= nodes_.size()) {
+bool HNSWIndex::IsVisibleAt(NodeId node_id, const std::string& key,
+                            SequenceNumber read_sequence) const {
+  if (node_id >= graph_.Size()) {
     return false;
   }
-  const Node& node = nodes_[node_id];
-  const auto versions_it = versions_by_key_.find(node.key);
+  const auto versions_it = versions_by_key_.find(key);
   if (versions_it == versions_by_key_.end()) {
     return false;
   }
@@ -278,75 +108,6 @@ bool HNSWIndex::IsVisible(NodeId node_id,
   }
   --visible;
   return !visible->second.deleted && visible->second.node_id == node_id;
-}
-
-std::vector<HNSWIndex::NodeId> HNSWIndex::SelectNeighbors(
-    const std::vector<Candidate>& candidates,
-    size_t limit) const {
-  std::vector<NodeId> selected;
-  std::vector<NodeId> pruned;
-  selected.reserve(std::min(limit, candidates.size()));
-
-  for (const Candidate& candidate : candidates) {
-    bool diverse = true;
-    for (NodeId neighbor : selected) {
-      if (Distance(VectorData(candidate.id), VectorData(neighbor)) <
-          candidate.distance) {
-        diverse = false;
-        break;
-      }
-    }
-    if (diverse) {
-      selected.push_back(candidate.id);
-      if (selected.size() == limit) {
-        return selected;
-      }
-    } else {
-      pruned.push_back(candidate.id);
-    }
-  }
-
-  for (NodeId candidate : pruned) {
-    selected.push_back(candidate);
-    if (selected.size() == limit) {
-      break;
-    }
-  }
-  return selected;
-}
-
-size_t HNSWIndex::NeighborLimit(int level) const {
-  return level == 0 ? 2 * options_.max_neighbors : options_.max_neighbors;
-}
-
-void HNSWIndex::PruneNeighbors(NodeId node_id, int level) {
-  auto& neighbors = nodes_[node_id].neighbors[level];
-  const size_t limit = NeighborLimit(level);
-  if (neighbors.size() <= limit) {
-    return;
-  }
-
-  std::vector<Candidate> candidates;
-  candidates.reserve(neighbors.size());
-  for (NodeId neighbor : neighbors) {
-    candidates.push_back(
-        {Distance(VectorData(node_id), VectorData(neighbor)), neighbor});
-  }
-  std::sort(candidates.begin(), candidates.end(), CandidateIsBetter);
-  neighbors = SelectNeighbors(candidates, limit);
-}
-
-void HNSWIndex::Connect(NodeId node_id,
-                        const std::vector<NodeId>& neighbors,
-                        int level) {
-  nodes_[node_id].neighbors[level] = neighbors;
-  for (NodeId neighbor : neighbors) {
-    auto& reverse = nodes_[neighbor].neighbors[level];
-    if (std::find(reverse.begin(), reverse.end(), node_id) == reverse.end()) {
-      reverse.push_back(node_id);
-      PruneNeighbors(neighbor, level);
-    }
-  }
 }
 
 Status HNSWIndex::Insert(std::string key,
@@ -405,69 +166,22 @@ Status HNSWIndex::InsertVersionLocked(std::string key,
       if (existing->second.deleted) {
         return Status::InvalidArgument("HNSW key version conflicts with tombstone");
       }
-      const Node& node = nodes_[existing->second.node_id];
-      if (VectorEquals(node.id, vector) && node.metadata == metadata) {
+      const NodeId node_id = existing->second.node_id;
+      if (graph_.VectorEquals(node_id, vector) &&
+          graph_.MetadataOf(node_id) == metadata) {
         return Status::OK();
       }
       return Status::InvalidArgument("HNSW key version already exists");
     }
   }
 
-  const int level = SelectLevel();
-  const NodeId node_id = nodes_.size();
-  Node node;
-  node.id = node_id;
-  node.key = key;
-  node.sequence = sequence;
-  node.vector_offset = vector_data_.size();
-  node.metadata = std::move(metadata);
-  node.neighbors.resize(static_cast<size_t>(level) + 1);
-  // Select links before publishing the node, so an invalid graph cannot leave
-  // a partially inserted version behind when traversal fails.
-  std::vector<NodeId> entry_points = {entry_point_};
-  for (int current_level = max_level_; current_level > level;
-       --current_level) {
-    const auto nearest = SearchLayer(vector, entry_points, 1, current_level);
-    if (nearest.empty()) {
-      return Status::Corruption("HNSW insertion has no valid layer entry");
-    }
-    entry_points.assign(1, nearest.front().id);
+  NodeId node_id = 0;
+  Status status = graph_.AddNode(vector, key, std::move(metadata), &node_id);
+  if (!status.ok()) {
+    return status;
   }
-
-  const int first_connected_level = std::min(level, max_level_);
-  for (int current_level = first_connected_level; current_level >= 0;
-       --current_level) {
-    const auto candidates = SearchLayer(
-        vector, entry_points,
-        std::max(options_.ef_construction, options_.max_neighbors),
-        current_level);
-    if (candidates.empty()) {
-      return Status::Corruption("HNSW insertion has no valid layer entry");
-    }
-    node.neighbors[current_level] =
-        SelectNeighbors(candidates, options_.max_neighbors);
-
-    entry_points.clear();
-    entry_points.reserve(candidates.size());
-    for (const Candidate& candidate : candidates) {
-      entry_points.push_back(candidate.id);
-    }
-  }
-
-  vector_data_.insert(vector_data_.end(), vector.begin(), vector.end());
-  nodes_.push_back(std::move(node));
-  versions_by_key_[std::move(key)].emplace(
-      sequence, VersionState{node_id, false});
-  for (int current_level = first_connected_level; current_level >= 0;
-       --current_level) {
-    const auto neighbors = nodes_[node_id].neighbors[current_level];
-    Connect(node_id, neighbors, current_level);
-  }
-
-  if (level > max_level_) {
-    entry_point_ = node_id;
-    max_level_ = level;
-  }
+  versions_by_key_[std::move(key)].emplace(sequence,
+                                           VersionState{node_id, false});
   return Status::OK();
 }
 
@@ -503,31 +217,49 @@ Status HNSWIndex::Save(const std::filesystem::path& path) const {
   std::uint64_t version_count = 0;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    for (const Node& node : nodes_) {
-      if (!FitsFixedString(node.key) || !FitsFixedString(node.metadata)) {
+
+    // node_id -> sequence. The graph deliberately does not store sequence
+    // numbers, so the on-disk node record recovers it from the version table.
+    // The file format is unchanged by the stage-1 split.
+    std::unordered_map<NodeId, SequenceNumber> sequence_of_node;
+    sequence_of_node.reserve(graph_.Size());
+    for (const auto& key_versions : versions_by_key_) {
+      for (const auto& version : key_versions.second) {
+        if (!version.second.deleted) {
+          sequence_of_node.emplace(version.second.node_id, version.first);
+        }
+      }
+    }
+    if (sequence_of_node.size() != graph_.Size()) {
+      return Status::Corruption("HNSW graph node is missing version state");
+    }
+
+    for (NodeId node_id = 0; node_id < graph_.Size(); ++node_id) {
+      const std::string& key = graph_.KeyOf(node_id);
+      const std::string& metadata = graph_.MetadataOf(node_id);
+      const size_t layer_count = graph_.LevelCount(node_id);
+      if (!FitsFixedString(key) || !FitsFixedString(metadata)) {
         return Status::InvalidArgument("HNSW key or metadata is too large");
       }
-      if (node.vector_offset > vector_data_.size() ||
-          vector_data_.size() - node.vector_offset < options_.dimension ||
-          node.neighbors.size() >
-              static_cast<size_t>(kMaximumRandomLevel + 1)) {
+      if (layer_count > static_cast<size_t>(kMaximumRandomLevel + 1)) {
         return Status::Corruption("invalid HNSW node state");
       }
-      AppendFixed64(&body, node.id);
-      AppendFixed32(&body, static_cast<std::uint32_t>(node.key.size()));
-      body.append(node.key);
-      AppendFixed64(&body, node.sequence);
-      const float* vector = VectorData(node.id);
+      AppendFixed64(&body, node_id);
+      AppendFixed32(&body, static_cast<std::uint32_t>(key.size()));
+      body.append(key);
+      AppendFixed64(&body, sequence_of_node.at(node_id));
+      const float* vector = graph_.VectorOf(node_id);
       for (size_t dimension = 0; dimension < options_.dimension; ++dimension) {
         const float value = vector[dimension];
         std::uint32_t bits = 0;
         std::memcpy(&bits, &value, sizeof(bits));
         AppendFixed32(&body, bits);
       }
-      AppendFixed32(&body, static_cast<std::uint32_t>(node.metadata.size()));
-      body.append(node.metadata);
-      AppendFixed32(&body, static_cast<std::uint32_t>(node.neighbors.size()));
-      for (const auto& neighbors : node.neighbors) {
+      AppendFixed32(&body, static_cast<std::uint32_t>(metadata.size()));
+      body.append(metadata);
+      AppendFixed32(&body, static_cast<std::uint32_t>(layer_count));
+      for (int level = 0; level < static_cast<int>(layer_count); ++level) {
+        const auto& neighbors = graph_.NeighborsOf(node_id, level);
         if (neighbors.size() > std::numeric_limits<std::uint32_t>::max()) {
           return Status::InvalidArgument("HNSW neighbor list is too large");
         }
@@ -564,10 +296,10 @@ Status HNSWIndex::Save(const std::filesystem::path& path) const {
     AppendFixed32(&file, static_cast<std::uint32_t>(options_.max_neighbors));
     AppendFixed32(&file, static_cast<std::uint32_t>(options_.ef_construction));
     AppendFixed32(&file, static_cast<std::uint32_t>(options_.metric));
-    AppendFixed32(&file, static_cast<std::uint32_t>(max_level_));
-    AppendFixed64(&file, nodes_.size());
+    AppendFixed32(&file, static_cast<std::uint32_t>(graph_.MaxLevel()));
+    AppendFixed64(&file, graph_.Size());
     AppendFixed64(&file, version_count);
-    AppendFixed64(&file, entry_point_);
+    AppendFixed64(&file, graph_.EntryPoint());
     file.append(body);
     AppendFixed32(&file, CRC32(body));
 
@@ -668,28 +400,32 @@ Status HNSWIndex::Load(const std::filesystem::path& path) {
       version_count > body_size / 22) {
     return Status::Corruption("HNSW counts exceed file size");
   }
-  std::vector<Node> loaded_nodes;
+  std::vector<HNSWGraphNode> loaded_nodes;
   loaded_nodes.reserve(static_cast<size_t>(node_count));
+  std::vector<SequenceNumber> loaded_sequences;
+  loaded_sequences.reserve(static_cast<size_t>(node_count));
   std::vector<float> loaded_vector_data;
   loaded_vector_data.reserve(static_cast<size_t>(node_count) * dimension);
   for (std::uint64_t node_index = 0; node_index < node_count; ++node_index) {
-    Node node;
-    status = ReadFixed64(input_view, &offset, &node.id);
+    std::uint64_t node_id = 0;
+    status = ReadFixed64(input_view, &offset, &node_id);
     if (!status.ok()) {
       return status;
     }
-    if (node.id != node_index) {
+    if (node_id != node_index) {
       return Status::Corruption("HNSW node ids are not dense");
     }
+    HNSWGraphNode node;
     status = ReadString(input_view, &offset, &node.key);
     if (!status.ok() || node.key.empty()) {
       return Status::Corruption("invalid HNSW node key");
     }
-    status = ReadFixed64(input_view, &offset, &node.sequence);
+    SequenceNumber sequence = 0;
+    status = ReadFixed64(input_view, &offset, &sequence);
     if (!status.ok()) {
       return status;
     }
-    node.vector_offset = loaded_vector_data.size();
+    loaded_sequences.push_back(sequence);
     bool has_nonzero_value = false;
     for (std::uint32_t vector_index = 0; vector_index < dimension;
          ++vector_index) {
@@ -725,13 +461,14 @@ Status HNSWIndex::Load(const std::filesystem::path& path) {
       auto& neighbors = node.neighbors[layer];
       std::uint32_t neighbor_count = 0;
       status = ReadFixed32(input_view, &offset, &neighbor_count);
-      const size_t limit = version == 1 ? max_neighbors : NeighborLimit(layer);
+      const size_t limit =
+          version == 1 ? max_neighbors : graph_.NeighborLimit(layer);
       if (!status.ok() || neighbor_count > limit ||
-          neighbor_count > (input_view.size() - offset) / sizeof(NodeId)) {
+          neighbor_count > (input_view.size() - offset) / sizeof(HNSWNodeId)) {
         return Status::Corruption("invalid HNSW neighbor count");
       }
       neighbors.resize(neighbor_count);
-      for (NodeId& neighbor : neighbors) {
+      for (HNSWNodeId& neighbor : neighbors) {
         status = ReadFixed64(input_view, &offset, &neighbor);
         if (!status.ok()) {
           return status;
@@ -786,15 +523,19 @@ Status HNSWIndex::Load(const std::filesystem::path& path) {
     return Status::Corruption("HNSW index checksum mismatch");
   }
 
+  // Everything below runs before any state is published, so a corrupt file
+  // cannot partially replace a live graph.
   int actual_max_level = -1;
-  for (const auto& node : loaded_nodes) {
+  for (size_t index = 0; index < loaded_nodes.size(); ++index) {
+    const HNSWGraphNode& node = loaded_nodes[index];
     actual_max_level = std::max(
         actual_max_level, static_cast<int>(node.neighbors.size()) - 1);
     auto versions_it = loaded_versions.find(node.key);
     if (versions_it == loaded_versions.end() ||
-        versions_it->second.find(node.sequence) == versions_it->second.end() ||
-        versions_it->second.at(node.sequence).deleted ||
-        versions_it->second.at(node.sequence).node_id != node.id) {
+        versions_it->second.find(loaded_sequences[index]) ==
+            versions_it->second.end() ||
+        versions_it->second.at(loaded_sequences[index]).deleted ||
+        versions_it->second.at(loaded_sequences[index]).node_id != index) {
       return Status::Corruption("HNSW node is missing version state");
     }
     for (size_t layer = 0; layer < node.neighbors.size(); ++layer) {
@@ -804,8 +545,8 @@ Status HNSWIndex::Load(const std::filesystem::path& path) {
           neighbors.end()) {
         return Status::Corruption("duplicate HNSW neighbor");
       }
-      for (NodeId neighbor : neighbors) {
-        if (neighbor == node.id ||
+      for (HNSWNodeId neighbor : neighbors) {
+        if (neighbor == index ||
             loaded_nodes[neighbor].neighbors.size() <= layer) {
           return Status::Corruption("invalid HNSW neighbor layer");
         }
@@ -813,26 +554,31 @@ Status HNSWIndex::Load(const std::filesystem::path& path) {
     }
   }
   if (actual_max_level != encoded_level ||
-      (node_count != 0 && loaded_nodes[entry_point].neighbors.size() !=
-                              static_cast<size_t>(encoded_level) + 1)) {
+      (node_count != 0 &&
+       loaded_nodes[entry_point].neighbors.size() !=
+           static_cast<size_t>(encoded_level) + 1)) {
     return Status::Corruption("HNSW entry point does not cover graph layers");
   }
   for (const auto& key_versions : loaded_versions) {
     for (const auto& version_state : key_versions.second) {
       if (!version_state.second.deleted) {
-        const auto& node = loaded_nodes[version_state.second.node_id];
-        if (node.key != key_versions.first || node.sequence != version_state.first) {
+        const HNSWGraphNode& node = loaded_nodes[version_state.second.node_id];
+        if (node.key != key_versions.first ||
+            loaded_sequences[version_state.second.node_id] !=
+                version_state.first) {
           return Status::Corruption("HNSW version refers to a different node");
         }
       }
     }
   }
+
+  status = graph_.Replace(std::move(loaded_nodes), std::move(loaded_vector_data),
+                          static_cast<HNSWNodeId>(entry_point), encoded_level);
+  if (!status.ok()) {
+    return status;
+  }
   std::unique_lock<std::shared_mutex> lock(mutex_);
-  nodes_ = std::move(loaded_nodes);
-  vector_data_ = std::move(loaded_vector_data);
   versions_by_key_ = std::move(loaded_versions);
-  max_level_ = node_count == 0 ? -1 : encoded_level;
-  entry_point_ = node_count == 0 ? 0 : entry_point;
   return Status::OK();
 }
 
@@ -849,15 +595,14 @@ Status HNSWIndex::MergeFrom(const std::filesystem::path& path) {
       if (version.second.deleted) {
         status = MarkDeleted(key_versions.first, version.first);
       } else {
-        if (version.second.node_id >= loaded.nodes_.size()) {
+        if (version.second.node_id >= loaded.graph_.Size()) {
           return Status::Corruption("HNSW version node id is out of range");
         }
-        const Node& node = loaded.nodes_[version.second.node_id];
-        const float* vector = loaded.VectorData(node.id);
-        status = InsertVersion(key_versions.first, version.first,
-                               std::vector<float>(
-                                   vector, vector + loaded.options_.dimension),
-                               node.metadata);
+        const float* vector = loaded.graph_.VectorOf(version.second.node_id);
+        status = InsertVersion(
+            key_versions.first, version.first,
+            std::vector<float>(vector, vector + loaded.options_.dimension),
+            loaded.graph_.MetadataOf(version.second.node_id));
       }
       if (!status.ok()) {
         return status;
@@ -890,13 +635,8 @@ Status HNSWIndex::ReplaceWith(HNSWIndex&& other) {
   std::unique_lock<std::shared_mutex> source_lock(other.mutex_,
                                                   std::defer_lock);
   std::lock(target_lock, source_lock);
-  nodes_ = std::move(other.nodes_);
-  vector_data_ = std::move(other.vector_data_);
+  graph_ = std::move(other.graph_);
   versions_by_key_ = std::move(other.versions_by_key_);
-  random_ = std::move(other.random_);
-  level_multiplier_ = other.level_multiplier_;
-  max_level_ = other.max_level_;
-  entry_point_ = other.entry_point_;
   return Status::OK();
 }
 
@@ -995,26 +735,22 @@ Status HNSWIndex::SearchAtSequenceLocked(
     SequenceNumber read_sequence,
     std::vector<VectorResult>* results) const {
   results->clear();
-  if (nodes_.empty()) {
+  if (graph_.Size() == 0) {
     return Status::OK();
   }
 
-  std::vector<NodeId> entry_points = {entry_point_};
-  for (int level = max_level_; level > 0; --level) {
-    const auto nearest = SearchLayer(query, entry_points, 1, level);
-    if (nearest.empty()) {
-      return Status::Corruption("HNSW search has no valid layer entry");
-    }
-    entry_points.assign(1, nearest.front().id);
+  const SequenceVisibility visibility(this, read_sequence);
+  std::vector<HNSWCandidate> candidates;
+  Status status =
+      graph_.Search(query, top_k, ef_search, &visibility, &candidates);
+  if (!status.ok()) {
+    return status;
   }
 
-  const auto nearest = SearchLayer(
-      query, entry_points, std::max(top_k, ef_search), 0, &read_sequence);
-  const size_t result_count = std::min(top_k, nearest.size());
-  results->reserve(result_count);
-  for (size_t i = 0; i < result_count; ++i) {
-    const Node& node = nodes_[nearest[i].id];
-    results->push_back({node.key, nearest[i].distance, node.metadata});
+  results->reserve(candidates.size());
+  for (const HNSWCandidate& candidate : candidates) {
+    results->push_back({graph_.KeyOf(candidate.id), candidate.distance,
+                        graph_.MetadataOf(candidate.id)});
   }
   std::sort(results->begin(), results->end(),
             [](const VectorResult& lhs, const VectorResult& rhs) {
@@ -1028,29 +764,12 @@ Status HNSWIndex::SearchAtSequenceLocked(
 
 size_t HNSWIndex::Size() const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
-  return nodes_.size();
+  return graph_.Size();
 }
 
 HNSWStats HNSWIndex::Stats() const {
   std::shared_lock<std::shared_mutex> lock(mutex_);
-  HNSWStats stats;
-  stats.node_count = nodes_.size();
-  stats.max_level = max_level_;
-  if (max_level_ >= 0) {
-    stats.nodes_per_level.resize(static_cast<size_t>(max_level_) + 1, 0);
-    stats.max_neighbors_per_level.resize(static_cast<size_t>(max_level_) + 1, 0);
-  }
-  for (const Node& node : nodes_) {
-    for (size_t level = 0; level < node.neighbors.size(); ++level) {
-      ++stats.nodes_per_level[level];
-      stats.max_neighbors_per_level[level] = std::max(
-          stats.max_neighbors_per_level[level], node.neighbors[level].size());
-      stats.directed_edge_count += node.neighbors[level].size();
-      stats.max_neighbor_count = std::max(
-          stats.max_neighbor_count, node.neighbors[level].size());
-    }
-  }
-  return stats;
+  return graph_.Stats();
 }
 
 }  // namespace kv

@@ -4,38 +4,30 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
-#include <random>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "hnsw_graph.h"
 #include "status.h"
 #include "types.h"
 #include "vector_value.h"
 
 namespace kv {
 
-struct HNSWOptions {
-  size_t dimension = 0;
-  // M: new nodes select M neighbors; reverse links may grow level 0 to 2*M.
-  size_t max_neighbors = 16;
-  size_t ef_construction = 200;
-  VectorDistanceMetric metric = VectorDistanceMetric::kL2;
-  std::uint64_t random_seed = 0x48534e57ULL;//"HNSW"的ASCII
-};
-
-struct HNSWStats {
-  size_t node_count = 0;
-  size_t directed_edge_count = 0;
-  size_t max_neighbor_count = 0;
-  int max_level = -1;
-  std::vector<size_t> nodes_per_level;
-  std::vector<size_t> max_neighbors_per_level;
-};
+// The graph owns these parameter and statistics types; the index re-exports the
+// names so that existing callers (include/db.h, benches, probes) keep compiling
+// unchanged.
+using HNSWOptions = HNSWGraphOptions;
+using HNSWStats = HNSWGraphStats;
 
 // HNSW index. Insertions and file loads are serialized while searches may run
 // concurrently. Version visibility is tracked by sequence and tombstones.
+//
+// Stage 1 of docs/VECTOR_INDEX_ARCHITECTURE.md split the pure graph structure
+// out into HNSWGraph. What remains here is exactly what the graph must not know
+// about: sequence numbers, tombstones, the file format, and the mutex.
 class HNSWIndex {
  public:
   explicit HNSWIndex(HNSWOptions options);
@@ -81,59 +73,32 @@ class HNSWIndex {
   HNSWStats Stats() const;
 
  private:
-  using NodeId = std::uint64_t;
-
-  struct Node {
-    NodeId id = 0;
-    std::string key;
-    SequenceNumber sequence = 0;
-    // Vectors live in vector_data_ as one contiguous, cache-friendly array.
-    size_t vector_offset = 0;
-    std::string metadata;
-    std::vector<std::vector<NodeId>> neighbors;
-  };
-
-  struct Candidate {
-    float distance = 0.0f;
-    NodeId id = 0;
-  };
+  using NodeId = HNSWNodeId;
 
   struct VersionState {
     NodeId node_id = 0;
     bool deleted = false;
   };
 
-  struct CandidateMinHeap {
-    bool operator()(const Candidate& lhs, const Candidate& rhs) const;
-  };
+  // Per-call visibility predicate handed to HNSWGraph::Search. It is built on
+  // the stack so that concurrent searches on the same index share no mutable
+  // state -- the read sequence travels with the call, exactly as before.
+  class SequenceVisibility final : public HNSWNodeVisibility {
+   public:
+    SequenceVisibility(const HNSWIndex* index, SequenceNumber read_sequence)
+        : index_(index), read_sequence_(read_sequence) {}
 
-  struct CandidateMaxHeap {
-    bool operator()(const Candidate& lhs, const Candidate& rhs) const;
+    bool IsVisible(HNSWNodeId node_id, const std::string& key) const override;
+
+   private:
+    const HNSWIndex* index_;
+    SequenceNumber read_sequence_;
   };
 
   Status ValidateOptions() const;
   Status ValidateVector(const std::vector<float>& vector) const;
-  static bool CandidateIsBetter(const Candidate& lhs,
-                                const Candidate& rhs);
-  int SelectLevel();
-  float Distance(const float* lhs, const float* rhs) const;
-  const float* VectorData(NodeId node_id) const;
-  bool VectorEquals(NodeId node_id, const std::vector<float>& vector) const;
-  std::vector<Candidate> SearchLayer(
-      const std::vector<float>& query,
-      const std::vector<NodeId>& entry_points,
-      size_t ef,
-      int level,
-      const SequenceNumber* read_sequence = nullptr) const;
-  std::vector<NodeId> SelectNeighbors(
-      const std::vector<Candidate>& candidates,
-      size_t limit) const;
-  void Connect(NodeId node_id,
-               const std::vector<NodeId>& neighbors,
-               int level);
-  void PruneNeighbors(NodeId node_id, int level);
-  size_t NeighborLimit(int level) const;
-  bool IsVisible(NodeId node_id, SequenceNumber read_sequence) const;
+  bool IsVisibleAt(NodeId node_id, const std::string& key,
+                   SequenceNumber read_sequence) const;
   Status InsertVersionLocked(std::string key,
                              SequenceNumber sequence,
                              const std::vector<float>& vector,
@@ -146,14 +111,9 @@ class HNSWIndex {
                                 std::vector<VectorResult>* results) const;
 
   HNSWOptions options_;
-  double level_multiplier_ = 0.0;
-  int max_level_ = -1;
-  NodeId entry_point_ = 0;
-  std::vector<Node> nodes_;
-  std::vector<float> vector_data_;
+  HNSWGraph graph_;
   std::unordered_map<std::string,
                      std::map<SequenceNumber, VersionState>> versions_by_key_;
-  std::mt19937_64 random_;
   mutable std::shared_mutex mutex_;
 };
 

@@ -4,6 +4,8 @@ project(mini_lsm_kv VERSION 0.1 LANGUAGES CXX)
 include(CTest)
 option(KV_ENABLE_RECALL_REGRESSION "Run 20k-vector recall regressions (slow)" OFF)
 option(KV_ENABLE_SIMD "Enable supported vector-distance SIMD backends" ON)
+option(KV_HNSW_DISTANCE_COUNTER
+       "Count HNSW distance computations (diagnostics; off by default)" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +18,7 @@ add_library(kvdb
     src/bloom_filter.cc
     src/db.cc
     src/format.cc
+    src/hnsw_graph.cc
     src/hnsw_index.cc
     src/manifest.cpp
     src/memtable.cc
@@ -31,6 +34,9 @@ target_compile_options(kvdb PRIVATE -Wall -Wextra -Wpedantic)
 if(NOT KV_ENABLE_SIMD)
     target_compile_definitions(kvdb PRIVATE KV_DISABLE_SIMD=1)
 endif()
+if(KV_HNSW_DISTANCE_COUNTER)
+    target_compile_definitions(kvdb PRIVATE KV_HNSW_DISTANCE_COUNTER=1)
+endif()
 
 if(BUILD_TESTING)
     add_executable(kv_test test/kv_test.cc)
@@ -41,7 +47,10 @@ if(BUILD_TESTING)
 
     add_test(NAME kv_test COMMAND kv_test)
     set_tests_properties(kv_test PROPERTIES TIMEOUT 60)
-    if(KV_SANITIZERS MATCHES "(^|,)thread(,|$)")
+    # Any sanitizer build slows this test well past the default budget: ASan+UBSan
+    # measured ~120 s in the container (16 s uninstrumented). The property wins
+    # over `ctest --timeout`, so it has to be raised here.
+    if(NOT KV_SANITIZERS STREQUAL "")
         set_tests_properties(kv_test PROPERTIES TIMEOUT 300)
     endif()
 
@@ -55,7 +64,6 @@ if(BUILD_TESTING)
         target_compile_definitions(hnsw_test PRIVATE KV_TEST_THREAD_SANITIZED=1)
         set_tests_properties(hnsw_test PROPERTIES TIMEOUT 300)
     endif()
-
     add_test(NAME week5_bench_sync_smoke
         COMMAND week5_bench --mode sync --operations 10000 --threads 2 --batch-size 8)
     set_tests_properties(week5_bench_sync_smoke PROPERTIES
@@ -78,6 +86,10 @@ target_compile_options(vector_bench PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(hnsw_recall_probe tools/hnsw_recall_probe.cpp)
 target_link_libraries(hnsw_recall_probe PRIVATE kvdb)
 target_compile_options(hnsw_recall_probe PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(hnsw_partition_probe tools/hnsw_partition_probe.cpp)
+target_link_libraries(hnsw_partition_probe PRIVATE kvdb)
+target_compile_options(hnsw_partition_probe PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(kv_stress stress/kv_stress.cpp)
 target_link_libraries(kv_stress PRIVATE kvdb)
