@@ -33,8 +33,9 @@ Status BloomFilter::Decode(const std::string& data, BloomFilter* filter) {
   }
   filter->bit_count_ = DecodeFixed32(data.data());
   filter->hash_count_ = DecodeFixed32(data.data() + 4);
-  const size_t expected = static_cast<size_t>((filter->bit_count_ + 7) / 8);
-  if (data.size() != expected + 8 || filter->hash_count_ == 0) {
+  const size_t expected = static_cast<size_t>((static_cast<std::uint64_t>(filter->bit_count_) + 7) / 8);
+  if (data.size() != expected + 8 || filter->bit_count_ == 0 ||
+      filter->hash_count_ == 0 || filter->hash_count_ > 30) {
     return Status::Corruption("invalid bloom filter payload");
   }
   filter->bits_.assign(data.begin() + 8, data.end());

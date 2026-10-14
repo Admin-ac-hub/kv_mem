@@ -10,7 +10,7 @@
 //      flush/compaction?
 //
 // Build:
-//   cmake -S . -B build-week6-bench -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+//   cmake -S . -B build-week6-bench -G Ninja -DCMAKE_BUILD_TYPE=Release -DKV_ENABLE_VECTOR_EXTENSION=ON -DBUILD_TESTING=OFF
 //   cmake --build build-week6-bench --parallel --target hnsw_recall_probe
 //
 // Usage:

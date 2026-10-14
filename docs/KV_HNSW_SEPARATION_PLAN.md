@@ -1,7 +1,7 @@
 # KV 与 HNSW 分离实施计划
 
 日期：2026-10-09  
-状态：待实施；本文中的模块、接口与构建命令均为目标设计，不代表当前已实现。  
+状态：已实施并完成本地双模式验收；结果、实际接口与证据见 [分离验收记录](KV_HNSW_SEPARATION_REPORT.md)。本文保留原实施设计和阶段顺序。
 主目标：把 HNSW 从 KV 核心中分离，保持 KV 主线行为与数据语义，向量检索作为可选扩展逐步演进。
 
 ## 1. 范围与完成定义
@@ -286,21 +286,21 @@ KV 性能比较固定机器、模式、数据规模、batch、MemTable、层阈�
 
 ## 9. 最终完成检查表
 
-- [ ] 当前工作区基线、已有改动与测试清单已记录。
-- [ ] kv_core 默认独立构建，kvdb alias 保持普通 KV 链接入口。
-- [ ] DB、Options、MemTable、WriteBatch 无活跃向量依赖。
-- [ ] Flush/Compaction/Open/Recover 不维护或访问 HNSW。
-- [ ] 普通 KV API、MVCC、批次、恢复、Iterator、维护行为回归通过。
-- [ ] 旧 WAL 和 Manifest 有独立 fixture 验证；新写入仅生成 Put/Delete。
-- [ ] 移除或损坏索引文件不影响纯 KV 打开、维护、重开。
-- [ ] VectorDB/VectorWriteBatch 的普通与向量操作、搜索、SearchBatch 工作。
-- [ ] 历史 Snapshot 搜索保留，更新/删除/Compaction 前后验证通过。
-- [ ] 写入结果能表达 KV 已提交但索引不可用，Dirty 与重建路径可验证。
-- [ ] 生命周期、并发、进程退出恢复、长期更新/删除回收测试通过。
-- [ ] 两种模式 Debug/Release/ASan+UBSan/TSan 与适用 benchmark 通过。
-- [ ] 核心消费端、构建图和符号检查证明无隐藏扩展依赖。
-- [ ] CI、README、迁移说明、验收记录与实际实现一致。
-- [ ] 原有未提交内容被保留；新增文件可审查，无无关产物混入。
+- [x] 当前工作区基线、已有改动与测试清单已记录。
+- [x] kv_core 默认独立构建，kvdb alias 保持普通 KV 链接入口。
+- [x] DB、Options、MemTable、WriteBatch 无活跃向量依赖。
+- [x] Flush/Compaction/Open/Recover 不维护或访问 HNSW。
+- [x] 普通 KV API、MVCC、批次、恢复、Iterator、维护行为回归通过。
+- [x] 旧 WAL 和 Manifest 有独立 fixture 验证；新写入仅生成 Put/Delete。
+- [x] 移除或损坏索引文件不影响纯 KV 打开、维护、重开。
+- [x] VectorDB/VectorWriteBatch 的普通与向量操作、搜索、SearchBatch 工作。
+- [x] 历史 Snapshot 搜索保留，更新/删除/Compaction 前后验证通过。
+- [x] 写入结果能表达 KV 已提交但索引不可用，Dirty 与重建路径可验证。
+- [x] 生命周期、并发、进程退出恢复、长期更新/删除回收测试通过。
+- [x] 两种模式 Debug/Release/ASan+UBSan/TSan 与适用 benchmark 通过。
+- [x] 核心消费端、构建图和符号检查证明无隐藏扩展依赖。
+- [x] CI、README、迁移说明、验收记录与实际实现一致。
+- [x] 原有未提交内容被保留；新增文件可审查，无无关产物混入。
 
 ## 10. 执行约束与后续顺序
 

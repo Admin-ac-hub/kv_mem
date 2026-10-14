@@ -1,0 +1,64 @@
+digraph "mini_lsm_kv" {
+node [
+  fontsize = "12"
+];
+subgraph clusterLegend {
+  label = "Legend";
+  color = black;
+  edge [ style = invis ];
+  legendNode0 [ label = "Executable", shape = egg ];
+  legendNode1 [ label = "Static Library", shape = octagon ];
+  legendNode2 [ label = "Shared Library", shape = doubleoctagon ];
+  legendNode3 [ label = "Module Library", shape = tripleoctagon ];
+  legendNode4 [ label = "Interface Library", shape = pentagon ];
+  legendNode5 [ label = "Object Library", shape = hexagon ];
+  legendNode6 [ label = "Unknown Library", shape = septagon ];
+  legendNode7 [ label = "Custom Target", shape = box ];
+  legendNode0 -> legendNode1 [ style = solid ];
+  legendNode0 -> legendNode2 [ style = solid ];
+  legendNode0 -> legendNode3;
+  legendNode1 -> legendNode4 [ label = "Interface", style = dashed ];
+  legendNode2 -> legendNode5 [ label = "Private", style = dotted ];
+  legendNode3 -> legendNode6 [ style = solid ];
+  legendNode0 -> legendNode7;
+}
+    "node0" [ label = "core_consumer_test", shape = egg ];
+    "node1" [ label = "kv_core\n(kvdb)", shape = octagon ];
+    "node2" [ label = "Threads::Threads", shape = pentagon ];
+    "node1" -> "node2"  // kv_core -> Threads::Threads
+    "node3" [ label = "kv_common", shape = octagon ];
+    "node1" -> "node3"  // kv_core -> kv_common
+    "node0" -> "node1" [ style = dotted ] // core_consumer_test -> kv_core
+    "node4" [ label = "hnsw", shape = octagon ];
+    "node4" -> "node2"  // hnsw -> Threads::Threads
+    "node5" [ label = "vector_value", shape = octagon ];
+    "node5" -> "node3"  // vector_value -> kv_common
+    "node4" -> "node5"  // hnsw -> vector_value
+    "node6" [ label = "hnsw_partition_probe", shape = egg ];
+    "node6" -> "node4" [ style = dotted ] // hnsw_partition_probe -> hnsw
+    "node7" [ label = "hnsw_recall_probe", shape = egg ];
+    "node7" -> "node4" [ style = dotted ] // hnsw_recall_probe -> hnsw
+    "node8" [ label = "hnsw_test", shape = egg ];
+    "node8" -> "node4" [ style = dotted ] // hnsw_test -> hnsw
+    "node9" [ label = "kv_bench", shape = egg ];
+    "node9" -> "node1" [ style = dotted ] // kv_bench -> kv_core
+    "node10" [ label = "kv_stress", shape = egg ];
+    "node10" -> "node1" [ style = dotted ] // kv_stress -> kv_core
+    "node11" [ label = "kv_test", shape = egg ];
+    "node11" -> "node1" [ style = dotted ] // kv_test -> kv_core
+    "node12" [ label = "legacy_compat_test", shape = egg ];
+    "node12" -> "node1" [ style = dotted ] // legacy_compat_test -> kv_core
+    "node13" [ label = "vector_bench", shape = egg ];
+    "node14" [ label = "vector_db", shape = octagon ];
+    "node14" -> "node4"  // vector_db -> hnsw
+    "node14" -> "node1"  // vector_db -> kv_core
+    "node13" -> "node14" [ style = dotted ] // vector_bench -> vector_db
+    "node15" [ label = "vector_db_failure_test", shape = egg ];
+    "node15" -> "node14" [ style = dotted ] // vector_db_failure_test -> vector_db
+    "node16" [ label = "vector_db_test", shape = egg ];
+    "node16" -> "node14" [ style = dotted ] // vector_db_test -> vector_db
+    "node17" [ label = "vector_value_test", shape = egg ];
+    "node17" -> "node5" [ style = dotted ] // vector_value_test -> vector_value
+    "node18" [ label = "week5_bench", shape = egg ];
+    "node18" -> "node1" [ style = dotted ] // week5_bench -> kv_core
+}

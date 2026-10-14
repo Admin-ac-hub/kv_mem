@@ -6,29 +6,32 @@
 #include <string>
 #include <vector>
 
-#include "hnsw_index.h"
-#include "skiplist.h"
 #include "status.h"
+#include "types.h"
 
 namespace kv {
 
+// Forward declaration: memtable.h deliberately does not include skiplist.h so
+// that users of MemTable (DB included) never depend on the skiplist internals.
+class SkipList;
+
 class MemTable {
  public:
-  explicit MemTable(std::shared_ptr<HNSWIndex> vector_index = nullptr);
+  MemTable();
+  ~MemTable();
+
+  MemTable(const MemTable&) = delete;
+  MemTable& operator=(const MemTable&) = delete;
 
   Status Put(std::string key, SequenceNumber sequence, std::string value);
-  Status PutVector(std::string key,
-                   SequenceNumber sequence,
-                   std::string encoded_value);
   Status Delete(std::string key, SequenceNumber sequence);
-  std::optional<SkipList::Entry> Get(const std::string& key,
-                                     SequenceNumber read_sequence) const;
+  std::optional<Entry> Get(const std::string& key,
+                           SequenceNumber read_sequence) const;
   std::vector<VersionedEntry> Entries() const;
   size_t Size() const;
 
  private:
-  SkipList table_;
-  std::shared_ptr<HNSWIndex> vector_index_;
+  std::unique_ptr<SkipList> table_;
 };
 
 }  // namespace kv

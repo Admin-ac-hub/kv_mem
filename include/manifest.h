@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <vector>
 
 #include "status.h"
@@ -12,7 +13,6 @@ namespace kv {
 struct SSTableMeta {
   std::uint64_t file_number = 0;
   std::filesystem::path file_path;
-  std::filesystem::path index_path;
   int level = 0;
   std::string smallest_key;
   std::string largest_key;
@@ -28,7 +28,8 @@ struct VersionEdit {
 
 class Manifest {
  public:
-  explicit Manifest(std::filesystem::path db_path);
+  explicit Manifest(std::filesystem::path db_path,
+                    std::function<Status()> before_sync = {});
 
   Status Load();
   Status Save(const VersionEdit& edit);
@@ -47,7 +48,6 @@ class Manifest {
   VersionEdit CurrentEdit() const;
 
  private:
-  Status LoadLegacyFullManifest(const std::string& contents);
   Status LoadEditLog();
   Status WriteCurrentFile();
 
@@ -55,7 +55,7 @@ class Manifest {
   std::filesystem::path manifest_path_;
   VersionEdit edit_;
   VersionEdit persisted_edit_;
-  bool legacy_format_loaded_ = false;
+  std::function<Status()> before_sync_;
 };
 
 }  // namespace kv

@@ -56,7 +56,7 @@ esac
 
 "${CMAKE_BIN}" -S "${ROOT_DIR}" -B "${BUILD_DIR}" -G Ninja \
   -DCMAKE_MAKE_PROGRAM="${NINJA_BIN}" \
-  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DKV_ENABLE_VECTOR_EXTENSION=ON
 "${CMAKE_BIN}" --build "${BUILD_DIR}" --parallel --target vector_bench
 
 # Preserve previous evidence. Use a fresh run directory for each comparison.

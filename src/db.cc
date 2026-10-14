@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -35,6 +38,19 @@ Status ValidateKey(const std::string& key) {
   return Status::OK();
 }
 
+Status ValidateOptions(const Options& options) {
+  if (options.db_path.empty()) return Status::InvalidArgument("db_path cannot be empty");
+  if (options.memtable_entries_limit == 0 || options.level0_sstable_limit == 0 ||
+      options.level1_size_limit_bytes == 0 || options.block_size == 0 ||
+      options.block_size > std::numeric_limits<std::uint32_t>::max()) {
+    return Status::InvalidArgument("storage limits must be positive; block_size must fit uint32");
+  }
+  if (options.bloom_bits_per_key == 0 || options.bloom_bits_per_key > 64) {
+    return Status::InvalidArgument("bloom_bits_per_key must be in [1, 64]");
+  }
+  return Status::OK();
+}
+
 bool RangesOverlap(const SSTableMeta& lhs, const SSTableMeta& rhs) {
   if (lhs.smallest_key.empty() || lhs.largest_key.empty() ||
       rhs.smallest_key.empty() || rhs.largest_key.empty()) {
@@ -43,9 +59,9 @@ bool RangesOverlap(const SSTableMeta& lhs, const SSTableMeta& rhs) {
   return lhs.smallest_key <= rhs.largest_key && rhs.smallest_key <= lhs.largest_key;
 }
 
-class VectorInternalIterator : public InternalIterator {
+class MemTableInternalIterator : public InternalIterator {
  public:
-  VectorInternalIterator(std::vector<VersionedEntry> entries,
+  MemTableInternalIterator(std::vector<VersionedEntry> entries,
                          SequenceNumber read_sequence,
                          Status status)
       : status_(std::move(status)) {
@@ -271,29 +287,13 @@ Status Iterator::status() const {
   return impl_->status();
 }
 
-std::string Status::ToString() const {
-  switch (code_) {
-    case Code::kOk:
-      return "OK";
-    case Code::kNotFound:
-      return "NotFound: " + message_;
-    case Code::kIOError:
-      return "IOError: " + message_;
-    case Code::kCorruption:
-      return "Corruption: " + message_;
-    case Code::kInvalidArgument:
-      return "InvalidArgument: " + message_;
-  }
-  return "Unknown";
-}
-
 DB::DB(std::filesystem::path db_path)
     : DB(Options{std::move(db_path)}) {}
 
 DB::DB(Options options)
     : options_(std::move(options)),
       active_memtable_(std::make_shared<MemTable>()),
-      manifest_(std::make_unique<Manifest>(options_.db_path)),
+      manifest_(std::make_unique<Manifest>(options_.db_path, options_.testing_before_manifest_sync)),
       block_cache_(std::make_shared<BlockCache>(options_.block_cache_capacity)) {}
 
 DB::~DB() {
@@ -301,13 +301,38 @@ DB::~DB() {
 }
 
 Status DB::Open() {
+  std::lock_guard<std::mutex> lifecycle(lifecycle_mu_);
+  std::lock_guard<std::mutex> write_lock(write_mu_);
   std::lock_guard<std::mutex> lock(version_mu_);
   if (!closed_) {
     return Status::InvalidArgument("database is already open");
   }
-  if (options_.db_path.empty()) {
-    return Status::InvalidArgument("db_path cannot be empty");
+  Status status;
+  try {
+    status = OpenUnlocked();
+  } catch (const std::filesystem::filesystem_error& error) {
+    status = Status::IOError(error.what());
+  } catch (const std::system_error& error) {
+    status = Status::IOError(error.what());
   }
+  if (!status.ok()) {
+    closed_ = true;
+    wal_.reset();
+    ReleaseDirectoryLock();
+  }
+  return status;
+}
+
+void DB::ReleaseDirectoryLock() {
+  if (directory_lock_fd_ >= 0) {
+    ::close(directory_lock_fd_);
+    directory_lock_fd_ = -1;
+  }
+}
+
+Status DB::OpenUnlocked() {
+  Status status = ValidateOptions(options_);
+  if (!status.ok()) return status;
   if (options_.error_if_exists && std::filesystem::exists(options_.db_path)) {
     return Status::InvalidArgument("database already exists");
   }
@@ -315,17 +340,13 @@ Status DB::Open() {
     return Status::IOError("database does not exist: " + options_.db_path.string());
   }
   std::filesystem::create_directories(options_.db_path);
-
-  vector_index_.reset();
-  if (options_.vector_dimension != 0) {
-    HNSWOptions hnsw_options;
-    hnsw_options.dimension = options_.vector_dimension;
-    hnsw_options.max_neighbors = options_.hnsw_max_neighbors;
-    hnsw_options.ef_construction = options_.hnsw_ef_construction;
-    hnsw_options.metric = options_.vector_distance_metric;
-    vector_index_ = std::make_shared<HNSWIndex>(hnsw_options);
+  directory_lock_fd_ = ::open((options_.db_path / "LOCK").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+  if (directory_lock_fd_ < 0) return Status::IOError("failed to open database LOCK");
+  if (::flock(directory_lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+    return Status::IOError("database directory is locked by another instance");
   }
-  active_memtable_ = std::make_shared<MemTable>(vector_index_);
+
+  active_memtable_ = std::make_shared<MemTable>();
   immutable_memtables_.clear();
   wal_.reset();
   {
@@ -334,19 +355,18 @@ Status DB::Open() {
     background_work_pending_ = false;
   }
   background_status_ = Status::OK();
+  // Cache keys contain file numbers; a reopened directory may have been replaced.
+  block_cache_ = std::make_shared<BlockCache>(options_.block_cache_capacity);
+  manifest_ = std::make_unique<Manifest>(options_.db_path, options_.testing_before_manifest_sync);
   active_wal_file_number_ = 1;
   active_memtable_oldest_wal_file_number_ = 1;
 
-  Status status = LoadOrRecoverManifest();
+  status = LoadOrRecoverManifest();
   if (!status.ok()) {
     return status;
   }
 
   status = OpenSSTables();
-  if (!status.ok()) {
-    return status;
-  }
-  status = RebuildVectorIndex();
   if (!status.ok()) {
     return status;
   }
@@ -362,17 +382,19 @@ Status DB::Open() {
     }
   }
 
-  wal_ = std::make_unique<WALWriter>(WALPath(active_wal_file_number_));
+  wal_ = std::make_unique<WALWriter>(WALPath(active_wal_file_number_), options_.testing_before_wal_sync);
   status = wal_->Open();
   if (!status.ok()) {
     return status;
   }
+  ++lifecycle_generation_;
   closed_ = false;
   background_worker_ = std::thread(&DB::BackgroundWorkerLoop, this);
   return Status::OK();
 }
 
 Status DB::Close() {
+  std::lock_guard<std::mutex> lifecycle(lifecycle_mu_);
   std::lock_guard<std::mutex> write_lock(write_mu_);
   std::unique_lock<std::mutex> lock(version_mu_);
   if (closed_) {
@@ -390,7 +412,7 @@ Status DB::Close() {
       immutable_memtables_.push_back(
           ImmutableMemTable{std::move(active_memtable_),
                             active_memtable_oldest_wal_file_number_});
-      active_memtable_ = std::make_shared<MemTable>(vector_index_);
+      active_memtable_ = std::make_shared<MemTable>();
       moved_active_memtable = true;
     } else if (wal_ != nullptr) {
       wal_->Close();
@@ -420,16 +442,24 @@ Status DB::Close() {
     status = Status::IOError("background flush did not drain all immutable memtables");
   }
   if (status.ok() && moved_active_memtable) {
-    const std::uint64_t next_wal_file_number = manifest_->AllocateFileNumber();
-    manifest_->SetWALFileNumber(next_wal_file_number);
-    active_wal_file_number_ = next_wal_file_number;
-    active_memtable_oldest_wal_file_number_ = next_wal_file_number;
-    status = SaveManifest();
+    std::uint64_t next_wal_file_number = 0;
+    status = AllocateFileNumber(&next_wal_file_number);
+    if (status.ok()) {
+      manifest_->SetWALFileNumber(next_wal_file_number);
+      active_wal_file_number_ = next_wal_file_number;
+      active_memtable_oldest_wal_file_number_ = next_wal_file_number;
+      status = SaveManifest();
+    }
     if (status.ok()) {
       status = RemoveObsoleteWALFiles(next_wal_file_number);
     }
   }
+  if (!status.ok()) SetBackgroundErrorLocked(status);
   closed_ = true;
+  for (auto& snapshot : snapshots_) {
+    snapshot->active_ = false;
+  }
+  ReleaseDirectoryLock();
   return status;
 }
 
@@ -437,14 +467,20 @@ Status DB::Write(const WriteBatch& batch) {
   std::lock_guard<std::mutex> write_lock(write_mu_);
   std::lock_guard<std::mutex> lock(version_mu_);
 
-  if (batch.Count() == 0) {
-    return Status::OK();
-  }
   if (!background_status_.ok()) {
     return background_status_;
   }
-  if (wal_ == nullptr) {
+  if (closed_ || wal_ == nullptr) {
     return Status::IOError("database is not open");
+  }
+  if (batch.Count() == 0) return Status::OK();
+  if (manifest_->NextFileNumber() == std::numeric_limits<std::uint64_t>::max()) {
+    return Status::InvalidArgument("file number range exhausted");
+  }
+  Status encoding_status = batch.ValidateEncoding();
+  if (!encoding_status.ok()) return encoding_status;
+  if (batch.Count() > std::numeric_limits<SequenceNumber>::max() - manifest_->LastSequence()) {
+    return Status::InvalidArgument("sequence number range exhausted");
   }
 
   for (const auto& operation : batch.Operations()) {
@@ -456,28 +492,6 @@ Status DB::Write(const WriteBatch& batch) {
       case WriteBatchOpType::kPut:
       case WriteBatchOpType::kDelete:
         break;
-      case WriteBatchOpType::kPutVector: {
-        VectorRecord record;
-        status = DecodeVectorValue(operation.value, &record);
-        if (!status.ok()) {
-          return status;
-        }
-        if (options_.vector_dimension != 0 &&
-            record.vector.size() != options_.vector_dimension) {
-          return Status::InvalidArgument(
-              "vector dimension does not match configured dimension");
-        }
-        if (vector_index_ != nullptr) {
-          float ignored_distance = 0.0f;
-          status = ComputeVectorDistance(record.vector, record.vector,
-                                         options_.vector_distance_metric,
-                                         &ignored_distance);
-          if (!status.ok()) {
-            return status;
-          }
-        }
-        break;
-      }
       default:
         return Status::InvalidArgument("unknown WriteBatch operation type");
     }
@@ -486,6 +500,8 @@ Status DB::Write(const WriteBatch& batch) {
   const SequenceNumber first_sequence = manifest_->LastSequence() + 1;
   Status status = wal_->AppendBatch(batch, first_sequence);
   if (!status.ok()) {
+    // A complete record may already be on disk. Do not reuse its sequences.
+    if (!status.IsInvalidArgument()) SetBackgroundErrorLocked(status);
     return status;
   }
 
@@ -497,10 +513,6 @@ Status DB::Write(const WriteBatch& batch) {
         case WriteBatchOpType::kPut:
           status = active_memtable_->Put(operation.key, sequence,
                                          operation.value);
-          break;
-        case WriteBatchOpType::kPutVector:
-          status = active_memtable_->PutVector(operation.key, sequence,
-                                               operation.value);
           break;
         case WriteBatchOpType::kDelete:
           status = active_memtable_->Delete(operation.key, sequence);
@@ -524,17 +536,6 @@ Status DB::Put(const std::string& key, const std::string& value) {
   return Write(batch);
 }
 
-Status DB::PutVector(const std::string& key,
-                     const std::vector<float>& vector,
-                     const std::string& metadata) {
-  WriteBatch batch;
-  Status status = batch.PutVector(key, vector, metadata);
-  if (!status.ok()) {
-    return status;
-  }
-  return Write(batch);
-}
-
 Status DB::Get(const std::string& key, std::string* value, const ReadOptions& options) {
   if (value == nullptr) {
     return Status::InvalidArgument("value output cannot be null");
@@ -550,6 +551,10 @@ Status DB::Get(const std::string& key, std::string* value, const ReadOptions& op
   std::vector<std::shared_ptr<SSTable>> sstables;
   {
     std::lock_guard<std::mutex> lock(version_mu_);
+    status = ValidateReadOptions(options);
+    if (!status.ok()) {
+      return status;
+    }
     read_sequence = ReadSequence(options);
     active = active_memtable_;
     immutable_memtables.reserve(immutable_memtables_.size());
@@ -616,185 +621,6 @@ Status DB::Get(const std::string& key, std::string* value, const ReadOptions& op
   return Status::NotFound("key not found");
 }
 
-Status DB::GetVector(const std::string& key,
-                     VectorRecord* record,
-                     const ReadOptions& options) {
-  if (record == nullptr) {
-    return Status::InvalidArgument("vector record output cannot be null");
-  }
-  std::string encoded;
-  Status status = Get(key, &encoded, options);
-  if (!status.ok()) {
-    return status;
-  }
-  status = DecodeVectorValue(encoded, record);
-  if (!status.ok()) {
-    return status;
-  }
-  if (options_.vector_dimension != 0 &&
-      record->vector.size() != options_.vector_dimension) {
-    return Status::Corruption(
-        "stored vector dimension does not match configured dimension");
-  }
-  record->key = key;
-  return Status::OK();
-}
-
-Status DB::BruteForceSearch(const std::vector<float>& query,
-                            size_t top_k,
-                            std::vector<VectorResult>* results,
-                            VectorDistanceMetric metric,
-                            const ReadOptions& options) {
-  if (results == nullptr) {
-    return Status::InvalidArgument("search results output cannot be null");
-  }
-  results->clear();
-
-  float validation_distance = 0.0f;
-  Status status = ComputeVectorDistance(query, query, metric,
-                                        &validation_distance);
-  if (!status.ok()) {
-    return status;
-  }
-  if (options_.vector_dimension != 0 &&
-      query.size() != options_.vector_dimension) {
-    return Status::InvalidArgument(
-        "query dimension does not match configured dimension");
-  }
-  if (top_k == 0) {
-    return Status::OK();
-  }
-
-  struct ResultBetter {
-    bool operator()(const VectorResult& lhs, const VectorResult& rhs) const {
-      if (lhs.distance != rhs.distance) {
-        return lhs.distance < rhs.distance;
-      }
-      return lhs.key < rhs.key;
-    }
-  };
-  std::priority_queue<VectorResult, std::vector<VectorResult>, ResultBetter>
-      nearest;
-
-  auto iterator = NewIterator(options);
-  for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
-    if (!IsEncodedVectorValue(iterator->value())) {
-      continue;
-    }
-
-    VectorRecord record;
-    status = DecodeVectorValue(iterator->value(), &record);
-    if (!status.ok()) {
-      return status;
-    }
-    if (record.vector.size() != query.size()) {
-      if (options_.vector_dimension != 0) {
-        return Status::Corruption(
-            "stored vector dimension does not match configured dimension");
-      }
-      continue;
-    }
-
-    float distance = 0.0f;
-    status = ComputeVectorDistance(query, record.vector, metric, &distance);
-    if (!status.ok()) {
-      return status;
-    }
-    VectorResult candidate{iterator->key(), distance, std::move(record.metadata)};
-    if (nearest.size() < top_k) {
-      nearest.push(std::move(candidate));
-    } else if (ResultBetter{}(candidate, nearest.top())) {
-      nearest.pop();
-      nearest.push(std::move(candidate));
-    }
-  }
-  status = iterator->status();
-  if (!status.ok()) {
-    results->clear();
-    return status;
-  }
-
-  results->reserve(nearest.size());
-  while (!nearest.empty()) {
-    results->push_back(nearest.top());
-    nearest.pop();
-  }
-  std::sort(results->begin(), results->end(),
-            [](const VectorResult& lhs, const VectorResult& rhs) {
-              if (lhs.distance != rhs.distance) {
-                return lhs.distance < rhs.distance;
-              }
-              return lhs.key < rhs.key;
-            });
-  return Status::OK();
-}
-
-Status DB::Search(const std::vector<float>& query,
-                  size_t top_k,
-                  size_t ef_search,
-                  std::vector<VectorResult>* results,
-                  const ReadOptions& options) {
-  if (results == nullptr) {
-    return Status::InvalidArgument("search results output cannot be null");
-  }
-  results->clear();
-
-  std::shared_ptr<HNSWIndex> index;
-  SequenceNumber read_sequence = 0;
-  {
-    std::lock_guard<std::mutex> lock(version_mu_);
-    if (closed_) {
-      return Status::IOError("database is not open");
-    }
-    if (vector_index_ == nullptr) {
-      return Status::InvalidArgument(
-          "indexed search requires a configured vector dimension");
-    }
-    index = vector_index_;
-    read_sequence = ReadSequence(options);
-  }
-
-  return index->SearchAtSequence(query, top_k, ef_search, read_sequence,
-                                 results);
-}
-
-Status DB::Search(const std::vector<float>& query,
-                  size_t top_k,
-                  std::vector<VectorResult>* results,
-                  const ReadOptions& options) {
-  return Search(query, top_k, 64, results, options);
-}
-
-Status DB::SearchBatch(
-    const std::vector<std::vector<float>>& queries,
-    size_t top_k,
-    size_t ef_search,
-    std::vector<std::vector<VectorResult>>* results,
-    const ReadOptions& options) {
-  if (results == nullptr) {
-    return Status::InvalidArgument("batch search results output cannot be null");
-  }
-  results->clear();
-
-  std::shared_ptr<HNSWIndex> index;
-  SequenceNumber read_sequence = 0;
-  {
-    std::lock_guard<std::mutex> lock(version_mu_);
-    if (closed_) {
-      return Status::IOError("database is not open");
-    }
-    if (vector_index_ == nullptr) {
-      return Status::InvalidArgument(
-          "indexed search requires a configured vector dimension");
-    }
-    index = vector_index_;
-    read_sequence = ReadSequence(options);
-  }
-
-  return index->SearchBatchAtSequence(queries, top_k, ef_search,
-                                      read_sequence, results);
-}
-
 Status DB::Delete(const std::string& key) {
   WriteBatch batch;
   batch.Delete(key);
@@ -812,7 +638,7 @@ Status DB::CompactUnlocked() {
   int target_level = 1;
   SequenceNumber min_snapshot = 0;
   std::uint64_t new_file_number = 0;
-  std::shared_ptr<HNSWIndex> index;
+  std::uint64_t generation = 0;
 
   {
     std::lock_guard<std::mutex> lock(version_mu_);
@@ -892,8 +718,9 @@ Status DB::CompactUnlocked() {
       return Status::OK();
     }
     min_snapshot = MinActiveSnapshotSequence();
-    new_file_number = manifest_->AllocateFileNumber();
-    index = vector_index_;
+    Status status = AllocateFileNumber(&new_file_number);
+    if (!status.ok()) return status;
+    generation = lifecycle_generation_;
   }
 
   std::set<std::uint64_t> input_numbers;
@@ -992,12 +819,9 @@ Status DB::CompactUnlocked() {
             });
 
   const std::filesystem::path new_path = SSTablePath(new_file_number);
-  const std::filesystem::path new_index_path = HNSWIndexPath(new_file_number);
   auto cleanup_new_files = [&] {
     (void)RemoveFileIfExists(new_path);
-    if (index != nullptr) {
-      (void)RemoveFileIfExists(new_index_path);
-    }
+
   };
   Status status = SSTable::CreateFromEntries(new_path, output,
                                              options_.block_size,
@@ -1013,35 +837,14 @@ Status DB::CompactUnlocked() {
     cleanup_new_files();
     return status;
   }
-  if (index != nullptr) {
-    status = SaveVectorIndexEntries(output, new_index_path);
-    if (!status.ok()) {
-      new_table.reset();
-      cleanup_new_files();
-      return status;
-    }
-  }
-
-  std::shared_ptr<HNSWIndex> rebuilt_index;
-  if (index != nullptr) {
-    status = BuildVectorIndexForCompaction(output, input_numbers, base_tables,
-                                           &rebuilt_index);
-    if (!status.ok()) {
-      new_table.reset();
-      cleanup_new_files();
-      return status;
-    }
-  }
-
   if (options_.testing_before_compaction_publish) {
     options_.testing_before_compaction_publish();
   }
 
   std::vector<std::shared_ptr<SSTable>> old_tables;
-  std::vector<SSTableMeta> old_metas;
   {
     std::lock_guard<std::mutex> lock(version_mu_);
-    if (closed_ || vector_index_ != index) {
+    if (closed_ || lifecycle_generation_ != generation) {
       new_table.reset();
       cleanup_new_files();
       return Status::IOError("database changed while compaction was building");
@@ -1061,62 +864,8 @@ Status DB::CompactUnlocked() {
       }
     }
 
-    if (rebuilt_index != nullptr) {
-      std::set<std::uint64_t> base_table_numbers;
-      for (const auto& table : base_tables) {
-        if (input_numbers.find(table->FileNumber()) == input_numbers.end()) {
-          base_table_numbers.insert(table->FileNumber());
-        }
-      }
-      for (const auto& table : sstables_) {
-        if (input_numbers.find(table->FileNumber()) != input_numbers.end() ||
-            base_table_numbers.find(table->FileNumber()) !=
-                base_table_numbers.end()) {
-          continue;
-        }
-        std::vector<VersionedEntry> entries;
-        status = table->Entries(&entries);
-        if (!status.ok()) {
-          new_table.reset();
-          cleanup_new_files();
-          return status;
-        }
-        for (const auto& entry : entries) {
-          status = AddVectorIndexEntryTo(rebuilt_index, entry);
-          if (!status.ok()) {
-            new_table.reset();
-            cleanup_new_files();
-            return status;
-          }
-        }
-      }
-
-      std::shared_lock<std::shared_mutex> memtable_lock(memtable_mu_);
-      for (const auto& immutable : immutable_memtables_) {
-        for (const auto& entry : immutable.memtable->Entries()) {
-          status = AddVectorIndexEntryTo(rebuilt_index, entry);
-          if (!status.ok()) {
-            new_table.reset();
-            cleanup_new_files();
-            return status;
-          }
-        }
-      }
-      if (active_memtable_ != nullptr) {
-        for (const auto& entry : active_memtable_->Entries()) {
-          status = AddVectorIndexEntryTo(rebuilt_index, entry);
-          if (!status.ok()) {
-            new_table.reset();
-            cleanup_new_files();
-            return status;
-          }
-        }
-      }
-    }
-
     const VersionEdit publish_edit = manifest_->CurrentEdit();
     old_tables = sstables_;
-    old_metas = publish_edit.sstables;
     sstables_.erase(std::remove_if(
                         sstables_.begin(), sstables_.end(),
                         [&](const std::shared_ptr<SSTable>& table) {
@@ -1135,8 +884,6 @@ Status DB::CompactUnlocked() {
     SSTableMeta new_meta;
     new_meta.file_number = new_table->FileNumber();
     new_meta.file_path = new_table->FilePath();
-    new_meta.index_path = index == nullptr ? std::filesystem::path{}
-                                           : new_index_path;
     new_meta.level = target_level;
     std::error_code file_size_ec;
     new_meta.file_size =
@@ -1160,16 +907,10 @@ Status DB::CompactUnlocked() {
       sstables_ = old_tables;
       manifest_->SetCurrentEdit(publish_edit);
       new_table.reset();
-      cleanup_new_files();
+      // The appended edit may be durable despite a sync error. Retain its file.
       return status;
     }
 
-    if (rebuilt_index != nullptr) {
-      status = index->ReplaceWith(std::move(*rebuilt_index));
-      if (!status.ok()) {
-        return status;
-      }
-    }
     ++compaction_count_;
   }
 
@@ -1179,16 +920,7 @@ Status DB::CompactUnlocked() {
       if (!remove_status.ok()) {
         return remove_status;
       }
-      for (const auto& meta : old_metas) {
-        if (meta.file_number == table->FileNumber() &&
-            !meta.index_path.empty()) {
-          remove_status = RemoveFileIfExists(meta.index_path);
-          if (!remove_status.ok()) {
-            return remove_status;
-          }
-          break;
-        }
-      }
+
     }
   }
   LogEvent("compaction end output SSTable " + std::to_string(new_file_number) +
@@ -1225,15 +957,6 @@ DBStats DB::Stats() const {
   return stats;
 }
 
-HNSWStats DB::VectorIndexStats() const {
-  std::shared_ptr<HNSWIndex> index;
-  {
-    std::lock_guard<std::mutex> lock(version_mu_);
-    index = vector_index_;
-  }
-  return index == nullptr ? HNSWStats{} : index->Stats();
-}
-
 Status DB::LoadOrRecoverManifest() {
   if (manifest_->Exists()) {
     return manifest_->Load();
@@ -1266,9 +989,6 @@ Status DB::LoadOrRecoverManifest() {
     } else if (ParseWALFileName(entry.path(), &number)) {
       min_wal_number = std::min(min_wal_number, number);
       max_wal_number = std::max(max_wal_number, number);
-    } else if (entry.path().filename() == "wal.log") {
-      min_wal_number = std::min<std::uint64_t>(min_wal_number, 1);
-      max_wal_number = std::max<std::uint64_t>(max_wal_number, 1);
     }
   }
 
@@ -1309,6 +1029,9 @@ Status DB::LoadOrRecoverManifest() {
   edit.sstables = std::move(tables);
   edit.wal_file_number = min_wal_number;
   edit.last_sequence = max_sequence;
+  if (std::max(max_sstable_number, max_wal_number) == std::numeric_limits<std::uint64_t>::max()) {
+    return Status::Corruption("file number range exhausted during manifest recovery");
+  }
   edit.next_file_number = max_sstable_number + 1;
   edit.next_file_number = std::max(edit.next_file_number, max_wal_number + 1);
   return manifest_->Save(edit);
@@ -1327,169 +1050,6 @@ Status DB::OpenSSTables() {
   return Status::OK();
 }
 
-Status DB::AddVectorIndexEntry(const VersionedEntry& entry) {
-  return AddVectorIndexEntryTo(vector_index_, entry);
-}
-
-Status DB::AddVectorIndexEntryTo(const std::shared_ptr<HNSWIndex>& index,
-                                 const VersionedEntry& entry) const {
-  if (index == nullptr) {
-    return Status::OK();
-  }
-  if (entry.deleted || !IsEncodedVectorValue(entry.value)) {
-    return index->MarkDeleted(entry.key, entry.sequence);
-  }
-
-  VectorRecord record;
-  Status status = DecodeVectorValue(entry.value, &record);
-  if (!status.ok()) {
-    return status;
-  }
-  if (record.vector.size() != options_.vector_dimension) {
-    return Status::Corruption(
-        "stored vector dimension does not match configured dimension");
-  }
-  return index->InsertVersion(entry.key, entry.sequence, record.vector,
-                              record.metadata);
-}
-
-Status DB::BuildVectorIndexForCompaction(
-    const std::vector<VersionedEntry>& output,
-    const std::set<std::uint64_t>& input_numbers,
-    const std::vector<std::shared_ptr<SSTable>>& tables,
-    std::shared_ptr<HNSWIndex>* rebuilt) const {
-  if (rebuilt == nullptr) {
-    return Status::InvalidArgument("rebuilt HNSW output cannot be null");
-  }
-  rebuilt->reset();
-  if (vector_index_ == nullptr) {
-    return Status::OK();
-  }
-
-  HNSWOptions index_options;
-  index_options.dimension = options_.vector_dimension;
-  index_options.max_neighbors = options_.hnsw_max_neighbors;
-  index_options.ef_construction = options_.hnsw_ef_construction;
-  index_options.metric = options_.vector_distance_metric;
-  auto replacement = std::make_shared<HNSWIndex>(index_options);
-
-  auto add_entries = [&](const std::vector<VersionedEntry>& entries) {
-    for (const auto& entry : entries) {
-      Status status = AddVectorIndexEntryTo(replacement, entry);
-      if (!status.ok()) {
-        return status;
-      }
-    }
-    return Status::OK();
-  };
-
-  Status status = add_entries(output);
-  if (!status.ok()) {
-    return status;
-  }
-  for (const auto& table : tables) {
-    if (input_numbers.find(table->FileNumber()) != input_numbers.end()) {
-      continue;
-    }
-    std::vector<VersionedEntry> entries;
-    status = table->Entries(&entries);
-    if (!status.ok()) {
-      return status;
-    }
-    status = add_entries(entries);
-    if (!status.ok()) {
-      return status;
-    }
-  }
-
-  *rebuilt = std::move(replacement);
-  return Status::OK();
-}
-
-Status DB::RebuildVectorIndex() {
-  if (vector_index_ == nullptr) {
-    return Status::OK();
-  }
-
-  // Each SSTable owns a sub-index containing exactly its entries.  Merge the
-  // live sub-indexes in file-number order. Keep the old scan as a compatibility
-  // path for databases created before index persistence was introduced.
-  bool all_tables_have_indexes = true;
-  for (const auto& meta : manifest_->SSTables()) {
-    if (meta.index_path.empty()) {
-      all_tables_have_indexes = false;
-      break;
-    }
-  }
-  if (all_tables_have_indexes && !manifest_->SSTables().empty()) {
-    bool first = true;
-    for (const auto& meta : manifest_->SSTables()) {
-      if (!std::filesystem::exists(meta.index_path)) {
-        return Status::IOError("MANIFEST references missing HNSW index: " +
-                               meta.index_path.string());
-      }
-      Status status = first ? vector_index_->Load(meta.index_path)
-                            : vector_index_->MergeFrom(meta.index_path);
-      first = false;
-      if (!status.ok()) {
-        return status;
-      }
-    }
-    return Status::OK();
-  }
-
-  for (const auto& table : sstables_) {
-    std::vector<VersionedEntry> entries;
-    ++sstable_full_scans_;
-    Status status = table->Entries(&entries);
-    if (!status.ok()) {
-      return status;
-    }
-    for (const auto& entry : entries) {
-      status = AddVectorIndexEntry(entry);
-      if (!status.ok()) {
-        return status;
-      }
-    }
-  }
-  return Status::OK();
-}
-
-Status DB::SaveVectorIndexEntries(
-    const std::vector<VersionedEntry>& entries,
-    const std::filesystem::path& path) const {
-  if (vector_index_ == nullptr) {
-    return Status::OK();
-  }
-  HNSWOptions index_options;
-  index_options.dimension = options_.vector_dimension;
-  index_options.max_neighbors = options_.hnsw_max_neighbors;
-  index_options.ef_construction = options_.hnsw_ef_construction;
-  index_options.metric = options_.vector_distance_metric;
-  HNSWIndex sub_index(index_options);
-  for (const auto& entry : entries) {
-    Status status;
-    if (entry.deleted || !IsEncodedVectorValue(entry.value)) {
-      status = sub_index.MarkDeleted(entry.key, entry.sequence);
-    } else {
-      VectorRecord record;
-      status = DecodeVectorValue(entry.value, &record);
-      if (status.ok() && record.vector.size() != options_.vector_dimension) {
-        status = Status::Corruption(
-            "stored vector dimension does not match configured dimension");
-      }
-      if (status.ok()) {
-        status = sub_index.InsertVersion(entry.key, entry.sequence,
-                                         record.vector, record.metadata);
-      }
-    }
-    if (!status.ok()) {
-      return status;
-    }
-  }
-  return sub_index.Save(path);
-}
-
 Status DB::Recover() {
   std::vector<std::pair<std::uint64_t, std::filesystem::path>> wal_files;
   const std::uint64_t oldest_live_wal = manifest_->WALFileNumber();
@@ -1504,14 +1064,15 @@ Status DB::Recover() {
     }
 
     std::uint64_t number = 0;
+    // Unpublished SSTables also consume numbers: never overwrite an orphan.
+    if (ParseSSTableFileName(entry.path(), &number)) {
+      max_seen_file_number = std::max(max_seen_file_number, number);
+    }
     if (ParseWALFileName(entry.path(), &number)) {
       max_seen_file_number = std::max(max_seen_file_number, number);
       if (number >= oldest_live_wal) {
         wal_files.push_back({number, entry.path()});
       }
-    } else if (entry.path().filename() == "wal.log" && oldest_live_wal <= 1) {
-      wal_files.push_back({1, entry.path()});
-      max_seen_file_number = std::max<std::uint64_t>(max_seen_file_number, 1);
     }
   }
 
@@ -1523,10 +1084,14 @@ Status DB::Recover() {
   active_wal_file_number_ = wal_files.empty() ? oldest_live_wal : wal_files.back().first;
   active_memtable_oldest_wal_file_number_ =
       wal_files.empty() ? oldest_live_wal : wal_files.front().first;
+  if (max_seen_file_number == std::numeric_limits<std::uint64_t>::max()) {
+    return Status::Corruption("file number range exhausted during WAL recovery");
+  }
   if (manifest_->NextFileNumber() <= max_seen_file_number) {
     manifest_->SetNextFileNumber(max_seen_file_number + 1);
   }
 
+  SequenceNumber last_replayed = 0;
   for (const auto& wal_file : wal_files) {
     LogEvent("recovery replay WAL " + wal_file.second.filename().string());
     WALReader reader(wal_file.second);
@@ -1541,28 +1106,20 @@ Status DB::Recover() {
         break;
       }
 
+      if (record.sequence <= last_replayed) {
+        return Status::Corruption("WAL sequence ranges overlap or are out of order");
+      }
+      last_replayed = record.sequence + record.batch.Count() - 1;
+
       SequenceNumber sequence = record.sequence;
       for (const auto& operation : record.batch.Operations()) {
+        status = ValidateKey(operation.key);
+        if (!status.ok()) return Status::Corruption("invalid key in WAL");
         switch (operation.type) {
           case WriteBatchOpType::kPut:
             status = active_memtable_->Put(operation.key, sequence,
                                            operation.value);
             break;
-          case WriteBatchOpType::kPutVector: {
-            VectorRecord vector_record;
-            status = DecodeVectorValue(operation.value, &vector_record);
-            if (!status.ok()) {
-              return status;
-            }
-            if (options_.vector_dimension != 0 &&
-                vector_record.vector.size() != options_.vector_dimension) {
-              return Status::InvalidArgument(
-                  "recovered vector dimension does not match configured dimension");
-            }
-            status = active_memtable_->PutVector(operation.key, sequence,
-                                                 operation.value);
-            break;
-          }
           case WriteBatchOpType::kDelete:
             status = active_memtable_->Delete(operation.key, sequence);
             break;
@@ -1595,11 +1152,13 @@ Status DB::FlushMemTable() {
 
   const VersionEdit old_edit = manifest_->CurrentEdit();
   const std::uint64_t old_wal_number = active_memtable_oldest_wal_file_number_;
-  const std::uint64_t new_wal_number = manifest_->AllocateFileNumber();
+  std::uint64_t new_wal_number = 0;
+  Status status = AllocateFileNumber(&new_wal_number);
+  if (!status.ok()) return status;
   LogEvent("memtable switch active WAL " + std::to_string(old_wal_number) +
            " -> " + std::to_string(new_wal_number));
-  auto new_wal = std::make_unique<WALWriter>(WALPath(new_wal_number));
-  Status status = new_wal->Open();
+  auto new_wal = std::make_unique<WALWriter>(WALPath(new_wal_number), options_.testing_before_wal_sync);
+  status = new_wal->Open();
   if (!status.ok()) {
     manifest_->SetCurrentEdit(old_edit);
     return status;
@@ -1615,7 +1174,7 @@ Status DB::FlushMemTable() {
     wal_->Close();
   }
   immutable_memtables_.push_back(ImmutableMemTable{active_memtable_, old_wal_number});
-  active_memtable_ = std::make_shared<MemTable>(vector_index_);
+  active_memtable_ = std::make_shared<MemTable>();
   active_wal_file_number_ = new_wal_number;
   active_memtable_oldest_wal_file_number_ = new_wal_number;
   wal_ = std::move(new_wal);
@@ -1654,7 +1213,11 @@ void DB::BackgroundWorkerLoop() {
         }
 
         immutable = immutable_memtables_.front();
-        sstable_number = manifest_->AllocateFileNumber();
+        Status allocation = AllocateFileNumber(&sstable_number);
+        if (!allocation.ok()) {
+          SetBackgroundErrorLocked(allocation);
+          return;
+        }
         LogEvent("flush start WAL " + std::to_string(immutable.wal_file_number) +
                  " -> SSTable " + std::to_string(sstable_number));
       }
@@ -1749,18 +1312,8 @@ Status DB::FlushImmutableMemTable(const ImmutableMemTable& immutable,
     return status;
   }
 
-  const std::filesystem::path index_path = HNSWIndexPath(sstable_number);
-  if (vector_index_ != nullptr) {
-    status = SaveVectorIndexEntries(entries, index_path);
-    if (!status.ok()) {
-      return status;
-    }
-  }
-
   meta->file_number = (*table)->FileNumber();
   meta->file_path = (*table)->FilePath();
-  meta->index_path = vector_index_ == nullptr ? std::filesystem::path{}
-                                              : index_path;
   meta->level = 0;
   std::error_code ec;
   meta->file_size = std::filesystem::file_size(meta->file_path, ec);
@@ -1817,10 +1370,26 @@ SequenceNumber DB::ReadSequence(const ReadOptions& options) const {
                                      : options.snapshot->sequence();
 }
 
+Status DB::ValidateReadOptions(const ReadOptions& options) const {
+  if (closed_) {
+    return Status::IOError("database is not open");
+  }
+  if (options.snapshot != nullptr) {
+    const auto found = std::find_if(snapshots_.begin(), snapshots_.end(),
+        [&](const std::unique_ptr<Snapshot>& snapshot) {
+          return snapshot.get() == options.snapshot && snapshot->active_;
+        });
+    if (found == snapshots_.end()) {
+      return Status::InvalidArgument("snapshot is released, foreign, or from a previous open");
+    }
+  }
+  return Status::OK();
+}
+
 SequenceNumber DB::MinActiveSnapshotSequence() const {
   SequenceNumber min_sequence = 0;
   for (const auto& snapshot : snapshots_) {
-    if (snapshot == nullptr) {
+    if (snapshot == nullptr || !snapshot->active_) {
       continue;
     }
     if (min_sequence == 0 || snapshot->sequence() < min_sequence) {
@@ -1832,6 +1401,9 @@ SequenceNumber DB::MinActiveSnapshotSequence() const {
 
 const Snapshot* DB::GetSnapshot() {
   std::lock_guard<std::mutex> lock(version_mu_);
+  if (closed_) {
+    return nullptr;
+  }
   snapshots_.push_back(std::unique_ptr<Snapshot>(new Snapshot(manifest_->LastSequence())));
   return snapshots_.back().get();
 }
@@ -1843,12 +1415,19 @@ void DB::ReleaseSnapshot(const Snapshot* snapshot) {
                            return candidate.get() == snapshot;
                          });
   if (it != snapshots_.end()) {
-    snapshots_.erase(it);
+    // Keep the small handle allocated until DB destruction so a stale raw
+    // pointer cannot alias a new snapshot after allocator address reuse.
+    (*it)->active_ = false;
   }
 }
 
 std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& options) {
   std::lock_guard<std::mutex> lock(version_mu_);
+  Status status = ValidateReadOptions(options);
+  if (!status.ok()) {
+    return std::make_unique<Iterator>(std::make_unique<MemTableInternalIterator>(
+        std::vector<VersionedEntry>{}, 0, status));
+  }
   const SequenceNumber read_sequence = ReadSequence(options);
   std::vector<std::unique_ptr<InternalIterator>> children;
 
@@ -1856,10 +1435,10 @@ std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& options) {
     children.push_back(table->NewIterator(read_sequence));
   }
   for (const auto& immutable : immutable_memtables_) {
-    children.push_back(std::make_unique<VectorInternalIterator>(
+    children.push_back(std::make_unique<MemTableInternalIterator>(
         immutable.memtable->Entries(), read_sequence, Status::OK()));
   }
-  children.push_back(std::make_unique<VectorInternalIterator>(
+  children.push_back(std::make_unique<MemTableInternalIterator>(
       active_memtable_->Entries(), read_sequence, Status::OK()));
 
   return std::make_unique<Iterator>(
@@ -1868,21 +1447,35 @@ std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& options) {
 
 Status DB::SaveManifest() {
   LogEvent("manifest edit append");
-  return manifest_->Save(manifest_->CurrentEdit());
+  Status status = manifest_->Save(manifest_->CurrentEdit());
+  if (!status.ok()) SetBackgroundErrorLocked(status);
+  return status;
+}
+
+Status DB::AllocateFileNumber(std::uint64_t* number) {
+  if (manifest_->NextFileNumber() == std::numeric_limits<std::uint64_t>::max()) {
+    return Status::IOError("file number range exhausted");
+  }
+  *number = manifest_->AllocateFileNumber();
+  return Status::OK();
 }
 
 Status DB::RemoveObsoleteWALFiles(std::uint64_t oldest_live_wal) {
   bool removed_any = false;
-  for (const auto& entry : std::filesystem::directory_iterator(options_.db_path)) {
-    if (!entry.is_regular_file()) {
+  std::error_code ec;
+  std::filesystem::directory_iterator iterator(options_.db_path, ec), end;
+  if (ec) return Status::IOError("failed to enumerate WAL directory: " + ec.message());
+  for (; iterator != end; iterator.increment(ec)) {
+    if (ec) return Status::IOError("failed to enumerate WAL directory: " + ec.message());
+    const auto& entry = *iterator;
+    const bool regular = entry.is_regular_file(ec);
+    if (ec) return Status::IOError("failed to inspect WAL entry: " + ec.message());
+    if (!regular) {
       continue;
     }
 
     std::uint64_t number = 0;
-    const bool numbered_wal = ParseWALFileName(entry.path(), &number);
-    const bool legacy_wal = entry.path().filename() == "wal.log";
-    if ((!numbered_wal || number >= oldest_live_wal) &&
-        (!legacy_wal || oldest_live_wal <= 1)) {
+    if (!ParseWALFileName(entry.path(), &number) || number >= oldest_live_wal) {
       continue;
     }
 
@@ -1892,6 +1485,7 @@ Status DB::RemoveObsoleteWALFiles(std::uint64_t oldest_live_wal) {
     }
     removed_any = true;
   }
+  if (ec) return Status::IOError("failed to enumerate WAL directory: " + ec.message());
   return removed_any ? FsyncDirectory(options_.db_path) : Status::OK();
 }
 
@@ -1903,10 +1497,6 @@ void DB::LogEvent(const std::string& message) const {
 
 std::filesystem::path DB::SSTablePath(std::uint64_t number) const {
   return options_.db_path / SSTableFileName(number);
-}
-
-std::filesystem::path DB::HNSWIndexPath(std::uint64_t number) const {
-  return options_.db_path / HNSWIndexFileName(number);
 }
 
 std::filesystem::path DB::WALPath(std::uint64_t number) const {

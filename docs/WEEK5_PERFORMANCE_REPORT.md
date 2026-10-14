@@ -83,7 +83,7 @@ DB::Put -> DB::Write -> WALWriter::AppendBatch -> FsyncFile -> fsync
 ```
 
 2 秒采样的 140 个主线程样本里，118 个位于 `FsyncFile`，其中 83 个在系统
-`fsync`；对应源码是 `src/wal.cc:105` 和 `src/format.cc:153`。这与 DB
+`fsync`；当前对应 `WALWriter::AppendBatch`（`src/wal.cc`）和 `FsyncFile`（`src/storage_util.cc`）。这与 DB
 batch 对比相互印证：问题不是单纯的 `std::string` 或 SkipList 分配，而是
 每次小写入都付出一次持久化固定成本。
 

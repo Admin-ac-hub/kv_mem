@@ -26,7 +26,6 @@ constexpr std::uint32_t kDataBlockMagic = 0x344b4c42;  // BLK4
 constexpr std::uint32_t kRestartInterval = 16;
 constexpr size_t kBlockTrailerSize = 5;
 constexpr std::uint8_t kNoCompression = 0;
-constexpr std::uint8_t kLegacyRawCompression = 1;
 
 void AppendFixed32(std::string* out, std::uint32_t value) {
   const size_t old_size = out->size();
@@ -124,92 +123,23 @@ std::string EncodeBlock(const std::vector<VersionedEntry>& entries,
   return payload;
 }
 
-Status DecodeLegacyBlockPayload(std::string_view payload,
-                                std::vector<VersionedEntry>* entries) {
-  if (payload.size() < 8) {
+Status DecodeBlockPayload(std::string_view block_data, std::string_view* payload) {
+  if (block_data.size() < kBlockTrailerSize + 16 ||
+      DecodeFixed32(block_data.data()) != kDataBlockMagic) {
     return Status::Corruption("invalid SSTable data block");
   }
-  const char* ptr = payload.data();
-  const char* end = ptr + payload.size();
-  const std::uint64_t record_count = DecodeFixed64(ptr);
-  ptr += 8;
-  if (record_count > (payload.size() - 8) / kRecordHeaderSize) {
-    return Status::Corruption("invalid SSTable data record count");
+  const auto compression_type =
+      static_cast<std::uint8_t>(block_data[block_data.size() - kBlockTrailerSize]);
+  if (compression_type != kNoCompression) {
+    return Status::Corruption("unknown SSTable compression type");
   }
-  entries->clear();
-  entries->reserve(static_cast<size_t>(record_count));
-
-  for (std::uint64_t i = 0; i < record_count; ++i) {
-    if (end - ptr < static_cast<std::ptrdiff_t>(kRecordHeaderSize)) {
-      return Status::Corruption("invalid SSTable data record");
-    }
-    const auto type = static_cast<SSTable::ValueType>(static_cast<std::uint8_t>(ptr[0]));
-    const SequenceNumber sequence = DecodeFixed64(ptr + 1);
-    const std::uint32_t key_size = DecodeFixed32(ptr + 9);
-    const std::uint32_t value_size = DecodeFixed32(ptr + 13);
-    ptr += kRecordHeaderSize;
-    const size_t data_size = static_cast<size_t>(key_size) + value_size;
-    if (static_cast<size_t>(end - ptr) < data_size) {
-      return Status::Corruption("invalid SSTable data payload");
-    }
-    VersionedEntry entry;
-    entry.key.assign(ptr, key_size);
-    entry.sequence = sequence;
-    ptr += key_size;
-    entry.value.assign(ptr, value_size);
-    ptr += value_size;
-
-    switch (type) {
-      case SSTable::ValueType::kPut:
-        entry.deleted = false;
-        break;
-      case SSTable::ValueType::kDelete:
-        entry.value.clear();
-        entry.deleted = true;
-        break;
-      default:
-        return Status::Corruption("unknown SSTable record type");
-    }
-    entries->push_back(std::move(entry));
-  }
-  if (ptr != end) {
-    return Status::Corruption("trailing SSTable data block bytes");
-  }
-  return Status::OK();
-}
-
-Status DecodeBlockPayload(std::string_view block_data,
-                          std::string_view* payload,
-                          bool* prefix_compressed) {
-  *prefix_compressed = false;
-  if (block_data.size() >= kBlockTrailerSize + 16 &&
-      DecodeFixed32(block_data.data()) == kDataBlockMagic) {
-    const auto compression_type = static_cast<std::uint8_t>(
-        block_data[block_data.size() - kBlockTrailerSize]);
-    if (compression_type != kNoCompression &&
-        compression_type != kLegacyRawCompression) {
-      return Status::Corruption("unknown SSTable compression type");
-    }
-    const std::uint32_t expected_crc =
-        DecodeFixed32(block_data.data() + block_data.size() - 4);
-    const std::string_view checksummed(block_data.data(), block_data.size() - 4);
-    if (CRC32(checksummed) != expected_crc) {
-      return Status::Corruption("SSTable data block checksum mismatch");
-    }
-    *payload = block_data.substr(0, block_data.size() - kBlockTrailerSize);
-    *prefix_compressed = true;
-    return Status::OK();
-  }
-
-  if (block_data.size() < 12) {
-    return Status::Corruption("invalid SSTable data block");
-  }
-  const std::uint32_t expected_crc = DecodeFixed32(block_data.data() + block_data.size() - 4);
-  const std::string_view legacy_payload(block_data.data(), block_data.size() - 4);
-  if (CRC32(legacy_payload) != expected_crc) {
+  const std::uint32_t expected_crc =
+      DecodeFixed32(block_data.data() + block_data.size() - 4);
+  const std::string_view checksummed(block_data.data(), block_data.size() - 4);
+  if (CRC32(checksummed) != expected_crc) {
     return Status::Corruption("SSTable data block checksum mismatch");
   }
-  *payload = legacy_payload;
+  *payload = block_data.substr(0, block_data.size() - kBlockTrailerSize);
   return Status::OK();
 }
 
@@ -497,7 +427,9 @@ Status SSTable::CreateFromEntries(
     const std::vector<VersionedEntry>& entries,
     size_t block_size,
     size_t bloom_bits_per_key) {
-  std::filesystem::create_directories(path.parent_path());
+  std::error_code directory_ec;
+  if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), directory_ec);
+  if (directory_ec) return Status::IOError("failed to create SSTable directory: " + directory_ec.message());
 
   const std::filesystem::path tmp_path = path.string() + ".tmp";
   std::vector<IndexEntry> index;
@@ -506,6 +438,10 @@ Status SSTable::CreateFromEntries(
     unique_keys.insert(entry.key);
   }
   std::vector<std::string> keys(unique_keys.begin(), unique_keys.end());
+  if (bloom_bits_per_key == 0 || bloom_bits_per_key > 64 ||
+      keys.size() > (std::numeric_limits<std::uint32_t>::max() - 7ULL) / bloom_bits_per_key) {
+    return Status::InvalidArgument("Bloom filter exceeds supported size or bits-per-key range");
+  }
 
   {
     std::ofstream stream(tmp_path, std::ios::binary | std::ios::trunc);
@@ -580,14 +516,14 @@ Status SSTable::CreateFromEntries(
 
   Status status = FsyncFile(tmp_path);
   if (!status.ok()) {
-    std::filesystem::remove(tmp_path);
+    (void)RemoveFileIfExists(tmp_path);
     return status;
   }
 
   std::error_code ec;
   std::filesystem::rename(tmp_path, path, ec);
   if (ec) {
-    std::filesystem::remove(tmp_path);
+    (void)RemoveFileIfExists(tmp_path);
     return Status::IOError("failed to rename SSTable temp file: " + ec.message());
   }
 
@@ -763,7 +699,7 @@ Status SSTable::LoadIndex() {
     }
     const std::uint32_t key_size = DecodeFixed32(ptr);
     ptr += 4;
-    if (end - ptr < static_cast<std::ptrdiff_t>(key_size + 16)) {
+    if (static_cast<std::uint64_t>(end - ptr) < static_cast<std::uint64_t>(key_size) + 16) {
       return Status::Corruption("invalid SSTable index entry");
     }
     std::string last_internal_key(ptr, key_size);
@@ -838,31 +774,9 @@ Status SSTable::GetFromBlock(const IndexEntry& index,
   }
 
   std::string_view payload;
-  bool prefix_compressed = false;
-  status = DecodeBlockPayload(block_data, &payload, &prefix_compressed);
+  status = DecodeBlockPayload(block_data, &payload);
   if (!status.ok()) {
     return status;
-  }
-  if (!prefix_compressed) {
-    std::vector<VersionedEntry> entries;
-    status = DecodeLegacyBlockPayload(payload, &entries);
-    if (!status.ok()) {
-      return status;
-    }
-    for (const auto& entry : entries) {
-      if (entry.key == key && entry.sequence <= read_sequence) {
-        *found = true;
-        if (matched_sequence != nullptr) *matched_sequence = entry.sequence;
-        if (!entry.deleted) {
-          *value = entry.value;
-        }
-        return Status::OK();
-      }
-      if (entry.key > key) {
-        break;
-      }
-    }
-    return Status::OK();
   }
 
   PrefixBlockLayout layout;
@@ -922,15 +836,11 @@ Status SSTable::GetFromBlock(const IndexEntry& index,
 Status SSTable::DecodeBlock(const std::string& block_data,
                             std::vector<VersionedEntry>* entries) const {
   std::string_view payload;
-  bool prefix_compressed = false;
-  Status status = DecodeBlockPayload(block_data, &payload, &prefix_compressed);
+  Status status = DecodeBlockPayload(block_data, &payload);
   if (!status.ok()) {
     return status;
   }
-  if (prefix_compressed) {
-    return DecodePrefixCompressedPayload(payload, entries);
-  }
-  return DecodeLegacyBlockPayload(payload, entries);
+  return DecodePrefixCompressedPayload(payload, entries);
 }
 
 }  // namespace kv

@@ -26,3 +26,6 @@ test/test_dbs/
 
 *.tmp
 *.log
+
+# Compatibility samples intentionally include historical WAL files.
+!test/fixtures/**/*.log

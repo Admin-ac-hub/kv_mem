@@ -9,7 +9,7 @@
 #include <string_view>
 #include <utility>
 
-#include "format.h"
+#include "storage_util.h"
 
 namespace kv {
 
@@ -17,7 +17,7 @@ namespace {
 
 constexpr int kMaximumRandomLevel = 63;
 constexpr std::uint64_t kIndexMagic = 0x4b56484e535731ULL;  // KVHNSW1
-// Version 2 permits 2*M neighbors at level 0. Version 1 remains readable.
+// Version 2 permits 2*M neighbors at level 0.
 constexpr std::uint32_t kIndexVersion = 2;
 constexpr size_t kIndexHeaderSize = 56;
 constexpr size_t kIndexFooterSize = 4;
@@ -366,7 +366,7 @@ Status HNSWIndex::Load(const std::filesystem::path& path) {
     return Status::Corruption("invalid HNSW index magic");
   }
   status = ReadFixed32(input_view, &offset, &version);
-  if (!status.ok() || (version != 1 && version != kIndexVersion)) {
+  if (!status.ok() || version != kIndexVersion) {
     return Status::Corruption("unsupported HNSW index version");
   }
   if (!(ReadFixed32(input_view, &offset, &dimension).ok() &&
@@ -461,8 +461,7 @@ Status HNSWIndex::Load(const std::filesystem::path& path) {
       auto& neighbors = node.neighbors[layer];
       std::uint32_t neighbor_count = 0;
       status = ReadFixed32(input_view, &offset, &neighbor_count);
-      const size_t limit =
-          version == 1 ? max_neighbors : graph_.NeighborLimit(layer);
+      const size_t limit = graph_.NeighborLimit(layer);
       if (!status.ok() || neighbor_count > limit ||
           neighbor_count > (input_view.size() - offset) / sizeof(HNSWNodeId)) {
         return Status::Corruption("invalid HNSW neighbor count");

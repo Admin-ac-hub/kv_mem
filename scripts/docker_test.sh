@@ -28,6 +28,7 @@ IMAGE="${KV_TEST_IMAGE:-kv-test:ubuntu24}"
 BUILD_VOLUME="${KV_TEST_BUILD_VOLUME:-kv-test-build}"
 DOCKERFILE="${REPO_ROOT}/docker/Dockerfile.test"
 BUILD_TYPE="${KV_TEST_BUILD_TYPE:-Release}"
+VECTOR_EXTENSION="${KV_TEST_VECTOR_EXTENSION:-OFF}"
 
 run_in_container() {
   "${DOCKER}" run --rm \
@@ -55,10 +56,10 @@ configure_and_build() {
     set -euo pipefail
     if [[ ! -f /work/CMakeCache.txt ]]; then
       echo '== configure =='
-      cmake -S /src -B /work -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTING=ON
+      cmake -S /src -B /work -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTING=ON -DKV_ENABLE_VECTOR_EXTENSION=${VECTOR_EXTENSION}
     else
       echo '== reconfigure (existing cache) =='
-      cmake -S /src -B /work
+      cmake -S /src -B /work -DKV_ENABLE_VECTOR_EXTENSION=${VECTOR_EXTENSION}
     fi
     echo '== build =='
     if [[ \$# -eq 0 ]]; then

@@ -1,5 +1,8 @@
 # Week 6 Vector Benchmark Report
 
+The runner now uses the optional `VectorDB` extension. Current module boundaries
+and validation are documented in [the separation report](KV_HNSW_SEPARATION_REPORT.md).
+
 ## Scope
 
 **Acceptance status: not passed.** No 1M × 768 formal result has been produced.
@@ -20,7 +23,7 @@ vector workloads:
 The suite uses a deterministic generated corpus and query noise, so each seed
 recreates the same data without retaining a multi-gigabyte source dataset in
 memory. Query mode first builds and closes the database, then reopens it before
-timing the HNSW reads. This includes persisted-index recovery in the workload
+timing the HNSW reads. This includes rebuilding the index from KV in the workload
 setup but excludes setup time from the query measurement.
 
 `--recall-queries` controls how many of the measured queries receive an exact,
@@ -39,7 +42,7 @@ set `RECALL_QUERY_COUNT=1000` to report Recall@10 for all 1,000 queries.
   carry offsets instead of owning independently allocated vector buffers.
 - Layer traversal uses a thread-local contiguous generation-marker array rather
   than allocating and zeroing a visited bitmap for each layer search.
-- `HNSWIndex::SearchBatch` and `DB::SearchBatch` validate a group of queries and
+- `HNSWIndex::SearchBatch` and `VectorDB::SearchBatch` validate a group of queries and
   hold the HNSW shared lock once for the group.
 
 ## Reproduction
@@ -61,8 +64,8 @@ MIXED_OPERATIONS=1000 RUN_ROOT="$PWD/bench_runs/example-new-run" \
 
 Use a Release build, idle host, local SSD, and at least three repetitions for a
 comparison. Write throughput includes deterministic vector generation and
-`DB::Write` and `Close()` (draining flush/compaction and index builds);
-write latency percentiles measure only `DB::Write` batch time,
+`VectorDB::Write` and `Close()` (draining KV flush/compaction);
+write latency percentiles measure only `VectorDB::Write` batch time, including index maintenance,
 normalized by its vector count. Query timing uses `SearchBatch`; its displayed
 percentile is batch elapsed time divided by the number of queries in that batch,
 so it is a per-query-equivalent latency, not a separately scheduled request

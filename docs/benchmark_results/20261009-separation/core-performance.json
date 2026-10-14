@@ -1,0 +1,56 @@
+[
+  {
+    "version": "old",
+    "run": 1,
+    "write_sec": 0.210008,
+    "read_sec": 0.258934,
+    "scan_sec": 0.00988229,
+    "flush_count": 40.0,
+    "compaction_count": 16.0
+  },
+  {
+    "version": "new",
+    "run": 1,
+    "write_sec": 0.246597,
+    "read_sec": 0.253254,
+    "scan_sec": 0.0101795,
+    "flush_count": 40.0,
+    "compaction_count": 16.0
+  },
+  {
+    "version": "old",
+    "run": 2,
+    "write_sec": 0.179218,
+    "read_sec": 0.254934,
+    "scan_sec": 0.0101071,
+    "flush_count": 40.0,
+    "compaction_count": 16.0
+  },
+  {
+    "version": "new",
+    "run": 2,
+    "write_sec": 0.178172,
+    "read_sec": 0.25057,
+    "scan_sec": 0.00971654,
+    "flush_count": 40.0,
+    "compaction_count": 16.0
+  },
+  {
+    "version": "old",
+    "run": 3,
+    "write_sec": 0.172191,
+    "read_sec": 0.252483,
+    "scan_sec": 0.00981092,
+    "flush_count": 40.0,
+    "compaction_count": 16.0
+  },
+  {
+    "version": "new",
+    "run": 3,
+    "write_sec": 0.176448,
+    "read_sec": 0.270835,
+    "scan_sec": 0.0101865,
+    "flush_count": 40.0,
+    "compaction_count": 16.0
+  }
+]

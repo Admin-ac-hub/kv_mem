@@ -1,5 +1,7 @@
 # 2026-09-16 评审修复记录
 
+> 历史记录：以下结果与待办描述的是 2026-09-16 状态。2026-10-09 已完成 KV/HNSW 分离，Flush/Compaction 不再维护图，向量接口已移到 `VectorDB`；当前行为与验证见 [分离验收记录](KV_HNSW_SEPARATION_REPORT.md)。下方命令已补充当前构建所需的扩展开关，重跑不会复现旧版的重复构图成本。
+
 本轮按“正确性、配置、测试、文档优先，再处理性能”执行。不是 A–G 全部关闭，
 也不是 Week 6 百万向量正式验收。原始输出见 [运行记录](benchmark_results/20260916-review/)。
 修改基于 `b37f98f` 及工作区已有的 Week 1–6 未提交代码；没有清除这些代码、构建目录或旧 worktree。
@@ -77,6 +79,13 @@ sequence 选择结果；固定时序测试覆盖覆盖写、删除、复活、Sn
 这是单次 6k 维护路径测量，不是长期稳态或 1M 验收，亦不能直接与旧 20k 无维护路径数字比较。
 原始输出见 `benchmark_results/20260916-review/write6000-maintenance.txt`。
 
+### 历史存储基线
+
+初次评审记录的旧版 Release、20,000 × 768 Float32、M=16、ef_construction=200、
+ef_search=128、batch=256 运行中，SSTable 为 **62,963,946 字节**，索引文件为
+**65,695,164 字节**，比值约 **1.04×**。该数据来自检查点 `1da617a` 中保存的初次评审，
+仅用于解释旧版索引重复存储向量的成本；当前扩展不写索引文件，不能将此比例用于当前版本。
+
 ## 需修正的原始归因
 
 - B2：反向边使用多样性启发式本身是常见做法，不能直接判定其错误。本轮试验
@@ -106,7 +115,8 @@ sequence 选择结果；固定时序测试覆盖覆盖写、删除、复活、Sn
 
 ```bash
 /opt/homebrew/bin/cmake -S . -B build-review-fixes -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DKV_ENABLE_RECALL_REGRESSION=ON
+  -DCMAKE_BUILD_TYPE=Release -DKV_ENABLE_VECTOR_EXTENSION=ON \
+  -DKV_ENABLE_RECALL_REGRESSION=ON
 /opt/homebrew/bin/cmake --build build-review-fixes --parallel
 /opt/homebrew/bin/ctest --test-dir build-review-fixes --output-on-failure
 
@@ -116,7 +126,7 @@ sequence 选择结果；固定时序测试覆盖覆盖写、删除、复活、Sn
 ./build-review-fixes/hnsw_recall_probe regression 20000 768 32 200 100
 
 /opt/homebrew/bin/cmake -S . -B build-review-scalar -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DKV_ENABLE_SIMD=OFF
+  -DCMAKE_BUILD_TYPE=Release -DKV_ENABLE_VECTOR_EXTENSION=ON -DKV_ENABLE_SIMD=OFF
 /opt/homebrew/bin/cmake --build build-review-scalar --target hnsw_recall_probe
 ./build-review-scalar/hnsw_recall_probe insert 5000 768 16 200
 ./build-review-fixes/hnsw_recall_probe insert 5000 768 16 200

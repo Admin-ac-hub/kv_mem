@@ -14,12 +14,6 @@ namespace kv {
 
 class SkipList {
  public:
-  struct Entry {
-    SequenceNumber sequence = 0;
-    std::string value;
-    bool deleted = false;
-  };
-
   SkipList();
   ~SkipList();
 

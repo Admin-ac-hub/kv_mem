@@ -104,4 +104,4 @@ cmake --build build-bench --config Release --target kv_bench
 
 ## 后续工作
 
-Benchmark 方法和项目级优化统一维护在 [README 的“后续优化方向”](../README.md#后续优化方向)。
+Benchmark 方法和项目级优化统一维护在 [README 的“后续方向”](../README.md#后续方向)。

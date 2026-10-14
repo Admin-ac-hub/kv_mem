@@ -1,6 +1,7 @@
 #include "write_batch.h"
 
 #include <utility>
+#include <limits>
 
 #include "format.h"
 
@@ -21,19 +22,6 @@ void AppendFixed32(std::string* out, std::uint32_t value) {
 void WriteBatch::Put(std::string key, std::string value) {
   operations_.push_back(
       WriteBatchOperation{WriteBatchOpType::kPut, std::move(key), std::move(value)});
-}
-
-Status WriteBatch::PutVector(std::string key,
-                             const std::vector<float>& vector,
-                             std::string metadata) {
-  std::string encoded;
-  Status status = EncodeVectorValue(vector, metadata, &encoded);
-  if (!status.ok()) {
-    return status;
-  }
-  operations_.push_back(WriteBatchOperation{
-      WriteBatchOpType::kPutVector, std::move(key), std::move(encoded)});
-  return Status::OK();
 }
 
 void WriteBatch::Delete(std::string key) {
@@ -60,6 +48,20 @@ std::string WriteBatch::Encode() const {
   return encoded;
 }
 
+Status WriteBatch::ValidateEncoding() const {
+  constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
+  if (Count() > limit) return Status::InvalidArgument("WriteBatch operation count is too large");
+  std::uint64_t size = 0;
+  for (const auto& operation : operations_) {
+    if (operation.key.size() > limit || operation.value.size() > limit) {
+      return Status::InvalidArgument("WriteBatch key or value is too large");
+    }
+    size += kOperationHeaderSize + operation.key.size() + operation.value.size();
+    if (size > limit) return Status::InvalidArgument("WriteBatch payload is too large");
+  }
+  return Status::OK();
+}
+
 Status WriteBatch::Decode(std::string_view encoded) {
   const char* ptr = encoded.data();
   const char* end = ptr + encoded.size();
@@ -71,15 +73,14 @@ Status WriteBatch::Decode(std::string_view encoded) {
     }
 
     const auto type = static_cast<WriteBatchOpType>(static_cast<std::uint8_t>(ptr[0]));
-    if (type != WriteBatchOpType::kPut && type != WriteBatchOpType::kDelete &&
-        type != WriteBatchOpType::kPutVector) {
+    if (type != WriteBatchOpType::kPut && type != WriteBatchOpType::kDelete) {
       return Status::Corruption("unknown WriteBatch operation type");
     }
 
     const std::uint32_t key_size = DecodeFixed32(ptr + 1);
     const std::uint32_t value_size = DecodeFixed32(ptr + 5);
     ptr += kOperationHeaderSize;
-    if (end - ptr < static_cast<std::ptrdiff_t>(key_size + value_size)) {
+    if (static_cast<std::uint64_t>(end - ptr) < static_cast<std::uint64_t>(key_size) + value_size) {
       return Status::Corruption("invalid WriteBatch operation payload");
     }
 
@@ -93,13 +94,7 @@ Status WriteBatch::Decode(std::string_view encoded) {
     if (operation.type == WriteBatchOpType::kDelete && !operation.value.empty()) {
       return Status::Corruption("delete operation carries a value");
     }
-    if (operation.type == WriteBatchOpType::kPutVector) {
-      VectorRecord record;
-      Status status = DecodeVectorValue(operation.value, &record);
-      if (!status.ok()) {
-        return Status::Corruption("invalid vector value in WriteBatch");
-      }
-    }
+
     decoded.push_back(std::move(operation));
   }
 

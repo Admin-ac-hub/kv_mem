@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-#include "db.h"
+#include "vector_db.h"
 
 namespace {
 
@@ -207,16 +207,16 @@ std::string KeyFor(size_t vector_id) {
   return "vector:" + std::to_string(vector_id);
 }
 
-kv::Options MakeOptions(const Args& args) {
-  kv::Options options;
-  options.db_path = args.path;
+kv::VectorOptions MakeOptions(const Args& args) {
+  kv::VectorOptions options;
+  options.kv_options.db_path = args.path;
   options.vector_dimension = args.dimension;
   options.hnsw_max_neighbors = args.hnsw_m;
   options.hnsw_ef_construction = args.ef_construction;
-  options.memtable_entries_limit = args.memtable_limit;
-  options.level0_sstable_limit = args.l0_limit;
-  options.level1_size_limit_bytes = args.l1_bytes;
-  options.block_cache_capacity = args.block_cache_capacity;
+  options.kv_options.memtable_entries_limit = args.memtable_limit;
+  options.kv_options.level0_sstable_limit = args.l0_limit;
+  options.kv_options.level1_size_limit_bytes = args.l1_bytes;
+  options.kv_options.block_cache_capacity = args.block_cache_capacity;
   return options;
 }
 
@@ -241,7 +241,7 @@ StorageUsage GetStorageUsage(const std::filesystem::path& path) {
   return usage;
 }
 
-bool Open(kv::DB* db) {
+bool Open(kv::VectorDB* db) {
   const kv::Status status = db->Open();
   if (!status.ok()) {
     std::cerr << status.ToString() << '\n';
@@ -250,7 +250,7 @@ bool Open(kv::DB* db) {
   return true;
 }
 
-bool PrintMaintenance(const Args& args, const kv::DB& db) {
+bool PrintMaintenance(const Args& args, const kv::VectorDB& db) {
   const auto stats = db.Stats();
   std::cout << "flush_count=" << stats.flush_count << '\n';
   std::cout << "compaction_count=" << stats.compaction_count << '\n';
@@ -263,7 +263,7 @@ bool PrintMaintenance(const Args& args, const kv::DB& db) {
   return true;
 }
 
-bool Ingest(kv::DB* db,
+bool Ingest(kv::VectorDB* db,
             const Args& args,
             size_t first_id,
             size_t count,
@@ -271,7 +271,7 @@ bool Ingest(kv::DB* db,
   const auto benchmark_start = std::chrono::steady_clock::now();
   for (size_t first = 0; first < count;) {
     const size_t batch_count = std::min(args.write_batch_size, count - first);
-    kv::WriteBatch batch;
+    kv::VectorWriteBatch batch;
     for (size_t offset = 0; offset < batch_count; ++offset) {
       const size_t id = first_id + first + offset;
       const kv::Status status = batch.PutVector(KeyFor(id), MakeVector(args, id));
@@ -281,7 +281,7 @@ bool Ingest(kv::DB* db,
       }
     }
     const auto start = std::chrono::steady_clock::now();
-    const kv::Status status = db->Write(batch);
+    const auto status = db->Write(batch);
     const auto end = std::chrono::steady_clock::now();
     if (!status.ok()) {
       std::cerr << status.ToString() << '\n';
@@ -301,7 +301,7 @@ bool Ingest(kv::DB* db,
 }
 
 bool PopulateDatabase(const Args& args, size_t vector_count) {
-  kv::DB db(MakeOptions(args));
+  kv::VectorDB db(MakeOptions(args));
   if (!Open(&db)) {
     return false;
   }
@@ -340,7 +340,7 @@ void PrintTiming(const std::string& prefix, const Timing& timing) {
             << Percentile(timing.per_operation_microseconds, 0.99) << '\n';
 }
 
-bool TimedQueries(kv::DB* db,
+bool TimedQueries(kv::VectorDB* db,
                   const Args& args,
                   size_t corpus_count,
                   Timing* timing,
@@ -444,7 +444,7 @@ double RecallAtK(const Args& args,
 }
 
 bool RunWrite(const Args& args) {
-  kv::DB db(MakeOptions(args));
+  kv::VectorDB db(MakeOptions(args));
   if (!Open(&db)) {
     return false;
   }
@@ -475,7 +475,7 @@ bool RunQuery(const Args& args) {
   if (!PopulateDatabase(args, args.vector_count)) {
     return false;
   }
-  kv::DB db(MakeOptions(args));
+  kv::VectorDB db(MakeOptions(args));
   if (!Open(&db)) {
     return false;
   }
@@ -509,7 +509,7 @@ bool RunMixed(const Args& args) {
   if (!PopulateDatabase(args, warm_vectors)) {
     return false;
   }
-  kv::DB db(MakeOptions(args));
+  kv::VectorDB db(MakeOptions(args));
   if (!Open(&db)) {
     return false;
   }

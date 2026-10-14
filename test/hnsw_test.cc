@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "hnsw_index.h"
-#include "format.h"
+#include "storage_util.h"
 
 namespace {
 
@@ -268,22 +268,6 @@ void TestPersistenceAndMerge() {
   CHECK(results.size() == 1);
   CHECK(results[0].key == "old");
   CHECK(results[0].metadata == "old-meta");
-
-  // The small graph obeys the old M limit, so changing only the header creates
-  // a valid v1 fixture (the body encoding and checksum are unchanged).
-  std::ifstream saved(first_path, std::ios::binary);
-  std::string legacy((std::istreambuf_iterator<char>(saved)), {});
-  kv::EncodeFixed32(1, legacy.data() + 8);
-  const auto legacy_path = root / "legacy.hnsw";
-  {
-    std::ofstream output(legacy_path, std::ios::binary);
-    output.write(legacy.data(), legacy.size());
-  }
-  kv::HNSWIndex legacy_index(options);
-  MustOK(legacy_index.Load(legacy_path));
-  MustOK(legacy_index.SearchAtSequence({1.0f, 0.0f, 0.0f}, 2, 16, 1,
-                                      &results));
-  CHECK(results.size() == 1 && results[0].key == "old");
 
   kv::HNSWIndex second(options);
   MustOK(second.InsertVersion("third", 4, {0.0f, 0.0f, 1.0f}, "third-meta"));

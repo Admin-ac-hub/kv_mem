@@ -1,0 +1,33 @@
+Test project /Users/ys/cppProject/KV/build-vector-release
+      Start  1: kv_test
+ 1/11 Test  #1: kv_test ..........................   Passed    2.11 sec
+      Start  2: legacy_compat_test
+ 2/11 Test  #2: legacy_compat_test ...............   Passed    0.30 sec
+      Start  3: core_consumer_test
+ 3/11 Test  #3: core_consumer_test ...............   Passed    0.30 sec
+      Start  4: week5_bench_sync_smoke
+ 4/11 Test  #4: week5_bench_sync_smoke ...........   Passed    0.08 sec
+      Start  5: kv_stress_fixed_seed
+ 5/11 Test  #5: kv_stress_fixed_seed .............   Passed    0.23 sec
+      Start  6: vector_value_test
+ 6/11 Test  #6: vector_value_test ................   Passed    0.29 sec
+      Start  7: hnsw_test
+ 7/11 Test  #7: hnsw_test ........................   Passed    0.42 sec
+      Start  8: vector_db_test
+ 8/11 Test  #8: vector_db_test ...................   Passed    0.90 sec
+      Start  9: vector_db_failure_test
+ 9/11 Test  #9: vector_db_failure_test ...........   Passed    0.44 sec
+      Start 10: vector_bench_maintenance
+10/11 Test #10: vector_bench_maintenance .........   Passed    0.56 sec
+      Start 11: vector_bench_smoke
+11/11 Test #11: vector_bench_smoke ...............   Passed    0.03 sec
+
+100% tests passed, 0 tests failed out of 11
+
+Label Time Summary:
+benchmark    =   0.66 sec*proc (3 tests)
+core         =   3.02 sec*proc (5 tests)
+stress       =   0.23 sec*proc (1 test)
+vector       =   2.64 sec*proc (6 tests)
+
+Total Test time (real) =   5.67 sec

@@ -1,6 +1,7 @@
 #include "manifest.h"
 
 #include <algorithm>
+#include <charconv>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -17,6 +18,13 @@ namespace {
 constexpr int kManifestVersion = 1;
 constexpr const char* kManifestFileName = "MANIFEST";
 constexpr const char* kCurrentFileName = "CURRENT";
+
+bool ReadUnsigned(std::istream& in, std::uint64_t* value) {
+  std::string token;
+  if (!(in >> token) || token.empty()) return false;
+  const auto result = std::from_chars(token.data(), token.data() + token.size(), *value);
+  return result.ec == std::errc{} && result.ptr == token.data() + token.size();
+}
 
 std::filesystem::path CurrentPath(const std::filesystem::path& db_path) {
   return db_path / kCurrentFileName;
@@ -52,9 +60,7 @@ std::string BuildEditPayload(const VersionEdit& persisted, const VersionEdit& ne
           << std::quoted(item.second.smallest_key) << ' '
           << std::quoted(item.second.largest_key) << ' '
           << item.second.file_size;
-      if (!item.second.index_path.empty()) {
-        out << ' ' << std::quoted(item.second.index_path.filename().string());
-      }
+
       out << '\n';
     }
   }
@@ -64,7 +70,8 @@ std::string BuildEditPayload(const VersionEdit& persisted, const VersionEdit& ne
 Status PersistEditRecord(const std::filesystem::path& path,
                          const VersionEdit& persisted,
                          const VersionEdit& edit,
-                         std::ios::openmode mode) {
+                         std::ios::openmode mode,
+                         const std::function<Status()>& before_sync) {
   const std::string payload = BuildEditPayload(persisted, edit);
   std::ostringstream header;
   header << "record " << payload.size() << ' ' << CRC32(payload) << '\n';
@@ -80,6 +87,10 @@ Status PersistEditRecord(const std::filesystem::path& path,
     if (!out) {
       return Status::IOError("failed to write MANIFEST edit");
     }
+  }
+  if (before_sync) {
+    Status status = before_sync();
+    if (!status.ok()) return status;
   }
   return FsyncFile(path);
 }
@@ -103,6 +114,7 @@ Status ParseEditPayload(const std::filesystem::path& db_path,
                         VersionEdit* edit) {
   std::istringstream parsed(payload);
   bool saw_version = false;
+  bool saw_next = false, saw_wal = false, saw_sequence = false;
   std::string line;
   while (std::getline(parsed, line)) {
     if (line.empty()) {
@@ -118,20 +130,23 @@ Status ParseEditPayload(const std::filesystem::path& db_path,
       }
       saw_version = true;
     } else if (tag == "next_file_number") {
-      if (!(line_stream >> edit->next_file_number)) {
+      if (!ReadUnsigned(line_stream, &edit->next_file_number)) {
         return Status::Corruption("invalid MANIFEST edit next_file_number");
       }
+      saw_next = true;
     } else if (tag == "wal_file_number") {
-      if (!(line_stream >> edit->wal_file_number)) {
+      if (!ReadUnsigned(line_stream, &edit->wal_file_number)) {
         return Status::Corruption("invalid MANIFEST edit wal_file_number");
       }
+      saw_wal = true;
     } else if (tag == "last_sequence") {
-      if (!(line_stream >> edit->last_sequence)) {
+      if (!ReadUnsigned(line_stream, &edit->last_sequence)) {
         return Status::Corruption("invalid MANIFEST edit last_sequence");
       }
+      saw_sequence = true;
     } else if (tag == "delete_file") {
       std::uint64_t file_number = 0;
-      if (!(line_stream >> file_number)) {
+      if (!ReadUnsigned(line_stream, &file_number)) {
         return Status::Corruption("invalid MANIFEST delete_file entry");
       }
       auto& files = edit->sstables;
@@ -143,33 +158,23 @@ Status ParseEditPayload(const std::filesystem::path& db_path,
     } else if (tag == "add_file") {
       SSTableMeta meta;
       std::string file_name;
-      if (!(line_stream >> meta.file_number >> file_name)) {
+      if (!ReadUnsigned(line_stream, &meta.file_number) || !(line_stream >> file_name)) {
         return Status::Corruption("invalid MANIFEST add_file entry");
       }
       meta.file_path = db_path / file_name;
+      if (file_name.find('/') != std::string::npos || file_name.find('\\') != std::string::npos) {
+        return Status::Corruption("MANIFEST SSTable must have a local file name");
+      }
       if (!(line_stream >> meta.level >> std::quoted(meta.smallest_key) >>
-            std::quoted(meta.largest_key) >> meta.file_size)) {
-        meta.level = 0;
-        meta.smallest_key.clear();
-        meta.largest_key.clear();
-        meta.file_size = 0;
-      } else {
-        line_stream >> std::ws;
-        if (!line_stream.eof()) {
-          std::string index_file;
-          if (!(line_stream >> std::quoted(index_file))) {
-            return Status::Corruption("invalid MANIFEST index file entry");
-          }
-          std::string trailing;
-          if (line_stream >> trailing || index_file.empty() ||
-              index_file.find('/') != std::string::npos ||
-              index_file.find('\\') != std::string::npos) {
-            return Status::Corruption("invalid MANIFEST index file name");
-          }
-          meta.index_path = db_path / index_file;
-        }
+            std::quoted(meta.largest_key)) || !ReadUnsigned(line_stream, &meta.file_size)) {
+        return Status::Corruption("invalid MANIFEST file metadata");
       }
       std::uint64_t parsed_number = 0;
+      if (meta.level < 0 || meta.level > 2 ||
+          (!meta.smallest_key.empty() && !meta.largest_key.empty() &&
+           meta.smallest_key > meta.largest_key)) {
+        return Status::Corruption("invalid MANIFEST level or key range");
+      }
       if (!ParseSSTableFileName(meta.file_path, &parsed_number) ||
           parsed_number != meta.file_number) {
         return Status::Corruption("invalid MANIFEST add_file name");
@@ -183,9 +188,12 @@ Status ParseEditPayload(const std::filesystem::path& db_path,
     } else {
       return Status::Corruption("unknown MANIFEST edit tag: " + tag);
     }
+    line_stream >> std::ws;
+    if (!line_stream.eof()) return Status::Corruption("trailing MANIFEST edit data");
   }
-  if (!saw_version) {
-    return Status::Corruption("MANIFEST edit missing version");
+  if (!saw_version || !saw_next || !saw_wal || !saw_sequence ||
+      edit->next_file_number == 0 || edit->wal_file_number == 0) {
+    return Status::Corruption("MANIFEST edit missing required fields or invalid file numbers");
   }
   std::sort(edit->sstables.begin(), edit->sstables.end(),
             [](const SSTableMeta& lhs, const SSTableMeta& rhs) {
@@ -194,106 +202,11 @@ Status ParseEditPayload(const std::filesystem::path& db_path,
   return Status::OK();
 }
 
-Status ParseLegacyFullManifest(const std::filesystem::path& db_path,
-                               const std::string& contents,
-                               VersionEdit* loaded) {
-  const size_t checksum_pos = contents.rfind("checksum ");
-  if (checksum_pos == std::string::npos) {
-    return Status::Corruption("MANIFEST missing checksum");
-  }
-
-  const std::string body = contents.substr(0, checksum_pos);
-  std::istringstream checksum_stream(contents.substr(checksum_pos));
-  std::string checksum_tag;
-  std::uint32_t expected_checksum = 0;
-  if (!(checksum_stream >> checksum_tag >> expected_checksum) || checksum_tag != "checksum") {
-    return Status::Corruption("invalid MANIFEST checksum line");
-  }
-  std::string trailing;
-  if (checksum_stream >> trailing) {
-    return Status::Corruption("trailing MANIFEST checksum data");
-  }
-  if (CRC32(body) != expected_checksum) {
-    return Status::Corruption("MANIFEST checksum mismatch");
-  }
-
-  bool saw_version = false;
-  bool saw_next = false;
-  bool saw_wal = false;
-  bool saw_last_sequence = false;
-
-  std::istringstream parsed(body);
-  std::string tag;
-  while (parsed >> tag) {
-    if (tag == "version") {
-      int version = 0;
-      if (!(parsed >> version) || version != kManifestVersion) {
-        return Status::Corruption("invalid MANIFEST version");
-      }
-      saw_version = true;
-    } else if (tag == "next_file_number") {
-      if (!(parsed >> loaded->next_file_number)) {
-        return Status::Corruption("invalid MANIFEST next_file_number");
-      }
-      saw_next = true;
-    } else if (tag == "wal_file_number") {
-      if (!(parsed >> loaded->wal_file_number)) {
-        return Status::Corruption("invalid MANIFEST wal_file_number");
-      }
-      saw_wal = true;
-    } else if (tag == "last_sequence") {
-      if (!(parsed >> loaded->last_sequence)) {
-        return Status::Corruption("invalid MANIFEST last_sequence");
-      }
-      saw_last_sequence = true;
-    } else if (tag == "sstable") {
-      SSTableMeta meta;
-      std::string file_name;
-      if (!(parsed >> meta.file_number >> file_name)) {
-        return Status::Corruption("invalid MANIFEST sstable entry");
-      }
-      meta.file_path = db_path / file_name;
-      std::uint64_t parsed_number = 0;
-      if (!ParseSSTableFileName(meta.file_path, &parsed_number) ||
-          parsed_number != meta.file_number) {
-        return Status::Corruption("invalid MANIFEST sstable file name");
-      }
-      if (!std::filesystem::exists(meta.file_path)) {
-        return Status::IOError("MANIFEST references missing SSTable: " +
-                               meta.file_path.string());
-      }
-      meta.level = 0;
-      meta.smallest_key.clear();
-      meta.largest_key.clear();
-      std::error_code ec;
-      meta.file_size = std::filesystem::file_size(meta.file_path, ec);
-      if (ec) {
-        meta.file_size = 0;
-      }
-      loaded->sstables.push_back(std::move(meta));
-    } else {
-      return Status::Corruption("unknown MANIFEST tag: " + tag);
-    }
-  }
-
-  if (!parsed.eof()) {
-    return Status::Corruption("failed to parse MANIFEST");
-  }
-  if (!saw_version || !saw_next || !saw_wal || !saw_last_sequence) {
-    return Status::Corruption("MANIFEST missing required fields");
-  }
-
-  std::sort(loaded->sstables.begin(), loaded->sstables.end(),
-            [](const SSTableMeta& lhs, const SSTableMeta& rhs) {
-              return lhs.file_number < rhs.file_number;
-            });
-  return Status::OK();
-}
-
 }  // namespace
 
-Manifest::Manifest(std::filesystem::path db_path)
-    : db_path_(std::move(db_path)), manifest_path_(db_path_ / kManifestFileName) {}
+Manifest::Manifest(std::filesystem::path db_path, std::function<Status()> before_sync)
+    : db_path_(std::move(db_path)), manifest_path_(db_path_ / kManifestFileName),
+      before_sync_(std::move(before_sync)) {}
 
 bool Manifest::Exists() const {
   return std::filesystem::exists(CurrentPath(db_path_)) ||
@@ -331,22 +244,10 @@ Status Manifest::Load() {
   }
   std::string contents((std::istreambuf_iterator<char>(in)),
                        std::istreambuf_iterator<char>());
-  if (contents.rfind("record ", 0) == 0) {
-    return LoadEditLog();
+  if (contents.rfind("record ", 0) != 0) {
+    return Status::Corruption("MANIFEST is not a record edit log");
   }
-  return LoadLegacyFullManifest(contents);
-}
-
-Status Manifest::LoadLegacyFullManifest(const std::string& contents) {
-  VersionEdit loaded;
-  Status status = ParseLegacyFullManifest(db_path_, contents, &loaded);
-  if (!status.ok()) {
-    return status;
-  }
-  edit_ = loaded;
-  persisted_edit_ = loaded;
-  legacy_format_loaded_ = true;
-  return Status::OK();
+  return LoadEditLog();
 }
 
 Status Manifest::LoadEditLog() {
@@ -389,6 +290,17 @@ Status Manifest::LoadEditLog() {
       return Status::Corruption("trailing MANIFEST edit header data");
     }
 
+    const auto payload_position = in.tellg();
+    in.seekg(0, std::ios::end);
+    const auto end_position = in.tellg();
+    if (payload_position < 0 || end_position < payload_position) {
+      return Status::IOError("failed to determine MANIFEST size");
+    }
+    if (payload_size > static_cast<std::uintmax_t>(end_position - payload_position)) {
+      torn_tail = true;
+      break;
+    }
+    in.seekg(payload_position);
     std::string payload(payload_size, '\0');
     in.read(payload.data(), static_cast<std::streamsize>(payload.size()));
     if (in.gcount() != static_cast<std::streamsize>(payload.size())) {
@@ -428,7 +340,6 @@ Status Manifest::LoadEditLog() {
   }
   edit_ = replayed;
   persisted_edit_ = replayed;
-  legacy_format_loaded_ = false;
   return Status::OK();
 }
 
@@ -449,65 +360,44 @@ Status Manifest::WriteCurrentFile() {
 
   Status status = FsyncFile(tmp_path);
   if (!status.ok()) {
-    std::filesystem::remove(tmp_path);
+    (void)RemoveFileIfExists(tmp_path);
     return status;
   }
 
   std::error_code ec;
   std::filesystem::rename(tmp_path, current_path, ec);
   if (ec) {
-    std::filesystem::remove(tmp_path);
+    (void)RemoveFileIfExists(tmp_path);
     return Status::IOError("failed to rename CURRENT temp file: " + ec.message());
   }
   return FsyncDirectory(db_path_);
 }
 
 Status Manifest::Save(const VersionEdit& edit) {
-  std::filesystem::create_directories(db_path_);
-  const bool current_exists = std::filesystem::exists(CurrentPath(db_path_));
+  std::error_code directory_ec;
+  std::filesystem::create_directories(db_path_, directory_ec);
+  if (directory_ec) return Status::IOError("failed to create MANIFEST directory: " + directory_ec.message());
+  const bool current_exists = std::filesystem::exists(CurrentPath(db_path_), directory_ec);
+  if (directory_ec) return Status::IOError("failed to inspect CURRENT: " + directory_ec.message());
 
-  if (legacy_format_loaded_) {
-    const std::filesystem::path tmp_path = manifest_path_.string() + ".tmp";
-    Status status = PersistEditRecord(tmp_path, VersionEdit{}, edit, std::ios::trunc);
-    if (!status.ok()) {
-      std::filesystem::remove(tmp_path);
-      return status;
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp_path, manifest_path_, ec);
-    if (ec) {
-      std::filesystem::remove(tmp_path);
-      return Status::IOError("failed to replace legacy MANIFEST: " + ec.message());
-    }
-    status = FsyncDirectory(db_path_);
-    if (!status.ok()) {
-      return status;
-    }
+  Status status =
+      PersistEditRecord(manifest_path_, persisted_edit_, edit, std::ios::app, before_sync_);
+  if (!status.ok()) {
+    return status;
+  }
+  status = FsyncDirectory(db_path_);
+  if (!status.ok()) {
+    return status;
+  }
+  if (!current_exists) {
     status = WriteCurrentFile();
     if (!status.ok()) {
       return status;
-    }
-  } else {
-    Status status =
-        PersistEditRecord(manifest_path_, persisted_edit_, edit, std::ios::app);
-    if (!status.ok()) {
-      return status;
-    }
-    status = FsyncDirectory(db_path_);
-    if (!status.ok()) {
-      return status;
-    }
-    if (!current_exists) {
-      status = WriteCurrentFile();
-      if (!status.ok()) {
-        return status;
-      }
     }
   }
 
   edit_ = edit;
   persisted_edit_ = edit;
-  legacy_format_loaded_ = false;
   return Status::OK();
 }
 

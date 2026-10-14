@@ -15,12 +15,13 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    name: ${{ matrix.os }} / ${{ matrix.build_type }} / vector=${{ matrix.vector }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
         build_type: [Debug, Release]
+        vector: ['OFF', 'ON']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
 
@@ -32,7 +33,8 @@ jobs:
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DBUILD_TESTING=ON
-          -DKV_ENABLE_RECALL_REGRESSION=${{ matrix.build_type == 'Release' && 'ON' || 'OFF' }}
+          -DKV_ENABLE_VECTOR_EXTENSION=${{ matrix.vector }}
+          -DKV_ENABLE_RECALL_REGRESSION=${{ matrix.vector == 'ON' && matrix.build_type == 'Release' && 'ON' || 'OFF' }}
 
       - name: Build
         run: cmake --build build --parallel
@@ -45,11 +47,12 @@ jobs:
           --output-on-failure
 
   sanitizers:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.platform.name }} / vector=${{ matrix.vector }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        vector: ['OFF', 'ON']
+        platform:
           - name: Ubuntu / ASan+UBSan
             os: ubuntu-latest
             sanitizers: address,undefined
@@ -62,7 +65,7 @@ jobs:
             os: ubuntu-latest
             sanitizers: thread
             compiler: clang++
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 30
     env:
       ASAN_OPTIONS: halt_on_error=1
@@ -76,9 +79,10 @@ jobs:
         run: >-
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Debug
-          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.platform.compiler }}
           -DBUILD_TESTING=ON
-          -DKV_SANITIZERS=${{ matrix.sanitizers }}
+          -DKV_ENABLE_VECTOR_EXTENSION=${{ matrix.vector }}
+          -DKV_SANITIZERS=${{ matrix.platform.sanitizers }}
 
       - name: Build
         run: cmake --build build --parallel

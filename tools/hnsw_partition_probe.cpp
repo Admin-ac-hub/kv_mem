@@ -11,7 +11,7 @@
 // numerator instead of a modelled one.
 //
 // Build:
-//   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+//   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DKV_ENABLE_VECTOR_EXTENSION=ON
 //   cmake --build build --parallel --target hnsw_partition_probe
 //
 // Usage:

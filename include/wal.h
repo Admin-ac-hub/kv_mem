@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 
 #include "status.h"
@@ -22,7 +23,8 @@ struct WALBatchRecord {
 
 class WALWriter {
  public:
-  explicit WALWriter(std::filesystem::path path);
+  explicit WALWriter(std::filesystem::path path,
+                     std::function<Status()> before_sync = {});
   ~WALWriter();
 
   WALWriter(const WALWriter&) = delete;
@@ -35,6 +37,7 @@ class WALWriter {
  private:
   std::filesystem::path path_;
   std::ofstream stream_;
+  std::function<Status()> before_sync_;
 };
 
 class WALReader {
@@ -44,7 +47,6 @@ class WALReader {
   Status ReadNext(WALBatchRecord* record, bool* eof);
 
  private:
-  Status ReadLegacyRecord(std::uint32_t expected_checksum, WALBatchRecord* record);
   Status ReadBatchRecord(std::uintmax_t record_offset,
                          WALBatchRecord* record,
                          bool* eof);

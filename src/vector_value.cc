@@ -23,7 +23,7 @@
 #define KV_CAN_USE_NEON_INTRINSICS 0
 #endif
 
-#include "format.h"
+#include "storage_util.h"
 
 namespace kv {
 

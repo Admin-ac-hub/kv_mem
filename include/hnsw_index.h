@@ -16,9 +16,8 @@
 
 namespace kv {
 
-// The graph owns these parameter and statistics types; the index re-exports the
-// names so that existing callers (include/db.h, benches, probes) keep compiling
-// unchanged.
+// The graph owns the parameters and statistics; the index re-exports them for
+// extension callers and standalone algorithm tools.
 using HNSWOptions = HNSWGraphOptions;
 using HNSWStats = HNSWGraphStats;
 
@@ -47,7 +46,6 @@ class HNSWIndex {
   Status Load(const std::filesystem::path& path);
   Status MergeFrom(const std::filesystem::path& path);
   // Atomically replace the graph state while keeping the index object alive.
-  // MemTables and in-flight searches hold shared pointers to this object.
   Status ReplaceWith(HNSWIndex&& other);
   Status Search(const std::vector<float>& query,
                 size_t top_k,

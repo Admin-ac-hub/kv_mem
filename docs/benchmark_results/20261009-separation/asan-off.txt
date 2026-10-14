@@ -1,0 +1,20 @@
+Test project /Users/ys/cppProject/KV/build-kv-asan
+    Start 1: kv_test
+1/5 Test #1: kv_test ..........................   Passed    6.15 sec
+    Start 2: legacy_compat_test
+2/5 Test #2: legacy_compat_test ...............   Passed    0.39 sec
+    Start 3: core_consumer_test
+3/5 Test #3: core_consumer_test ...............   Passed    0.33 sec
+    Start 4: week5_bench_sync_smoke
+4/5 Test #4: week5_bench_sync_smoke ...........   Passed    0.37 sec
+    Start 5: kv_stress_fixed_seed
+5/5 Test #5: kv_stress_fixed_seed .............   Passed    0.89 sec
+
+100% tests passed, 0 tests failed out of 5
+
+Label Time Summary:
+benchmark    =   0.37 sec*proc (1 test)
+core         =   8.13 sec*proc (5 tests)
+stress       =   0.89 sec*proc (1 test)
+
+Total Test time (real) =   8.14 sec

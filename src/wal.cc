@@ -10,7 +10,6 @@ namespace kv {
 namespace {
 
 constexpr std::uint32_t kWALBatchMagic = 0x41574c4b;  // KLWA, little-endian on disk.
-constexpr size_t kLegacyHeaderSize = 17;
 constexpr size_t kBatchHeaderWithoutMagicSize = 21;
 constexpr size_t kBatchChecksumOffset = 17;
 
@@ -26,20 +25,10 @@ void AppendFixed64(std::string* out, std::uint64_t value) {
   EncodeFixed64(value, out->data() + old_size);
 }
 
-Status ReadPayload(std::ifstream* stream, std::string* payload, const std::string& what) {
-  if (payload->empty()) {
-    return Status::OK();
-  }
-  stream->read(payload->data(), static_cast<std::streamsize>(payload->size()));
-  if (stream->gcount() != static_cast<std::streamsize>(payload->size())) {
-    return Status::Corruption("incomplete WAL " + what);
-  }
-  return Status::OK();
-}
-
 }  // namespace
 
-WALWriter::WALWriter(std::filesystem::path path) : path_(std::move(path)) {}
+WALWriter::WALWriter(std::filesystem::path path, std::function<Status()> before_sync)
+    : path_(std::move(path)), before_sync_(std::move(before_sync)) {}
 
 WALWriter::~WALWriter() {
   Close();
@@ -47,12 +36,17 @@ WALWriter::~WALWriter() {
 
 Status WALWriter::Open() {
   Close();
-  std::filesystem::create_directories(path_.parent_path());
+  std::error_code ec;
+  if (!path_.parent_path().empty()) std::filesystem::create_directories(path_.parent_path(), ec);
+  if (ec) return Status::IOError("failed to create WAL directory: " + ec.message());
   stream_.open(path_, std::ios::binary | std::ios::app);
   if (!stream_.is_open()) {
     return Status::IOError("failed to open WAL for append: " + path_.string());
   }
-  return Status::OK();
+  // Persist the name of a newly created WAL before acknowledging its records.
+  Status status = FsyncDirectory(path_.parent_path().empty() ? std::filesystem::path(".") : path_.parent_path());
+  if (!status.ok()) Close();
+  return status;
 }
 
 void WALWriter::Close() {
@@ -68,8 +62,10 @@ Status WALWriter::AppendBatch(const WriteBatch& batch, SequenceNumber sequence) 
   if (!stream_.is_open()) {
     return Status::IOError("WAL writer is not open");
   }
-  if (batch.Count() > std::numeric_limits<std::uint32_t>::max()) {
-    return Status::InvalidArgument("WriteBatch operation count is too large");
+  Status status = batch.ValidateEncoding();
+  if (!status.ok()) return status;
+  if (sequence == 0 || batch.Count() - 1 > std::numeric_limits<SequenceNumber>::max() - sequence) {
+    return Status::InvalidArgument("invalid WAL sequence range");
   }
 
   const std::string payload = batch.Encode();
@@ -102,6 +98,10 @@ Status WALWriter::AppendBatch(const WriteBatch& batch, SequenceNumber sequence) 
   if (!stream_) {
     return Status::IOError("failed to append WAL batch record");
   }
+  if (before_sync_) {
+    status = before_sync_();
+    if (!status.ok()) return status;
+  }
   return FsyncFile(path_);
 }
 
@@ -113,7 +113,10 @@ Status WALReader::ReadNext(WALBatchRecord* record, bool* eof) {
   record->batch.Clear();
 
   if (!opened_) {
-    if (!std::filesystem::exists(path_)) {
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path_, ec);
+    if (ec) return Status::IOError("failed to inspect WAL: " + ec.message());
+    if (!exists) {
       *eof = true;
       return Status::OK();
     }
@@ -144,55 +147,9 @@ Status WALReader::ReadNext(WALBatchRecord* record, bool* eof) {
 
   const std::uint32_t word = DecodeFixed32(first_word.data());
   if (word != kWALBatchMagic) {
-    return ReadLegacyRecord(word, record);
+    return Status::Corruption("invalid WAL batch magic");
   }
   return ReadBatchRecord(record_offset, record, eof);
-}
-
-Status WALReader::ReadLegacyRecord(std::uint32_t expected_checksum,
-                                   WALBatchRecord* record) {
-  std::array<char, kLegacyHeaderSize> header{};
-  stream_.read(header.data(), static_cast<std::streamsize>(header.size()));
-  if (stream_.gcount() != static_cast<std::streamsize>(header.size())) {
-    return Status::Corruption("incomplete legacy WAL header");
-  }
-
-  const auto legacy_type = static_cast<WriteBatchOpType>(
-      static_cast<std::uint8_t>(header[0]));
-  if (legacy_type != WriteBatchOpType::kPut &&
-      legacy_type != WriteBatchOpType::kDelete) {
-    return Status::Corruption("unknown legacy WAL record type");
-  }
-
-  const SequenceNumber sequence = DecodeFixed64(header.data() + 1);
-  const std::uint32_t key_size = DecodeFixed32(header.data() + 9);
-  const std::uint32_t value_size = DecodeFixed32(header.data() + 13);
-
-  std::string key(key_size, '\0');
-  Status status = ReadPayload(&stream_, &key, "legacy key");
-  if (!status.ok()) {
-    return status;
-  }
-  std::string value(value_size, '\0');
-  status = ReadPayload(&stream_, &value, "legacy value");
-  if (!status.ok()) {
-    return status;
-  }
-
-  std::string checksummed(header.data(), header.size());
-  checksummed.append(key);
-  checksummed.append(value);
-  if (CRC32(checksummed) != expected_checksum) {
-    return Status::Corruption("legacy WAL checksum mismatch");
-  }
-
-  record->sequence = sequence;
-  if (legacy_type == WriteBatchOpType::kPut) {
-    record->batch.Put(std::move(key), std::move(value));
-  } else {
-    record->batch.Delete(std::move(key));
-  }
-  return Status::OK();
 }
 
 Status WALReader::ReadBatchRecord(std::uintmax_t record_offset,
@@ -217,6 +174,21 @@ Status WALReader::ReadBatchRecord(std::uintmax_t record_offset,
   const std::uint32_t payload_size = DecodeFixed32(header.data() + 13);
   const std::uint32_t expected_checksum =
       DecodeFixed32(header.data() + kBatchChecksumOffset);
+
+  if (count == 0 || sequence == 0 ||
+      count - 1 > std::numeric_limits<SequenceNumber>::max() - sequence) {
+    return Status::Corruption("invalid WAL sequence range or empty batch");
+  }
+  const auto payload_position = stream_.tellg();
+  stream_.seekg(0, std::ios::end);
+  const auto end_position = stream_.tellg();
+  if (payload_position < 0 || end_position < payload_position) {
+    return Status::IOError("failed to determine WAL size");
+  }
+  if (payload_size > static_cast<std::uint64_t>(end_position - payload_position)) {
+    return TruncateTornTail(record_offset, eof);
+  }
+  stream_.seekg(payload_position);
 
   std::string payload(payload_size, '\0');
   if (payload_size > 0) {

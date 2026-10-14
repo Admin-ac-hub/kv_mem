@@ -1,150 +1,89 @@
 # KV 主线工程收尾计划
 
-## 目标
+更新：2026-10-09。当前目标是冻结可复现、能解释的纯 KV 基线，用于一周后的面试准备。
+本文件记录已验证边界和后续待办；后续待办不是面试前必须完成的承诺。
 
-先把项目收敛成一个边界清楚、可恢复、可测试、可交付的单机 LSM KV 引擎。
+## 当前范围与状态
 
-HNSW 是扩展能力，暂时只要求保持可编译、可测试和与 KV 生命周期兼容。混合检索、并行索引构建、百万向量性能不作为 KV 主线完成条件，待 KV 基线稳定后再单独推进。
+KV 主线包含 WAL/WriteBatch、SkipList MemTable、后台 Flush、SSTable/Bloom/Cache、
+Manifest/CURRENT、MVCC/Snapshot/Iterator 和简化 L0/L1/L2 Compaction。
+默认 `KV_ENABLE_VECTOR_EXTENSION=OFF`，核心只存字节；可选 VectorDB/HNSW 独立构建。
+模块分离和兼容证据见 [分离验收记录](KV_HNSW_SEPARATION_REPORT.md)。该记录里的
+5/11 个测试是分离时的历史结果；新增 core_boundary_test 后当前默认为 6 个，扩展为 12 个。
 
-2026-10-09 补充：进入实现前先完成 KV/HNSW 模块分离，保证 KV 主线行为与旧数据兼容。详细阶段、接口边界和验收标准见 [KV 与 HNSW 分离实施计划](KV_HNSW_SEPARATION_PLAN.md)。下文涉及向量 API、配置、索引失败和索引文件清理的任务，分离后由扩展层承担。
+| 边界 | 当前实现与证据 |
+| --- | --- |
+| 生命周期 | Open/Close 串行，重复 Open 拒绝，重复 Close 允许，同对象可重开；关闭后新读/写/Compact 拒绝，空批次也检查状态 |
+| Snapshot | 检查所属 DB、有效状态及 Open 周期；释放句柄保留到析构，但不保留历史版本 |
+| Iterator | 固定创建时读视图，SSTable 按块加载，MemTable 复制；已有 Iterator 可在 Close 后读 pin 的视图，应在 DB 销毁前释放 |
+| Options | 路径非空；MemTable/L0/L1/block 阈值为正，block_size 不超过 uint32；Bloom bits/key 为 1–64，cache=0 禁用 |
+| 路径与实例 | 路径冲突通过 Status 返回；LOCK/flock 拒绝第二个协作实例，失败 Open/Close 释放锁，不删除 LOCK 文件 |
+| 写入边界 | key 不为空且不含 tab/newline/NUL；长度、总 payload、sequence 和文件号范围检查在写前执行；值允许任意字节 |
+| 持久化错误 | WAL I/O 或 Manifest 发布错误阻止后续写入；结果可能已提交，Close/Open 后确认；不复用不确定 WAL 的 sequence |
+| 发布与文件 | Manifest 发布错误保留新 SSTable，正常有 Manifest 时忽略孤儿文件；恢复保留孤儿文件编号以免覆盖 |
+| 格式恢复 | 支持超过六位的文件号；WAL 序号范围、Manifest 必需字段/本地文件名/层级范围、载荷长度及部分整数溢出检查 |
+| 后台与读取 | Flush/Compaction 错误传播；Get 按 sequence 裁决；Iterator/读请求 pin 已打开 SSTable，Compaction 删除后可继续读 |
 
-## 一、冻结范围并建立基线
+实现入口：[db.cc](../src/db.cc)、[wal.cc](../src/wal.cc)、[manifest.cpp](../src/manifest.cpp)、
+[core_boundary_test.cc](../test/core_boundary_test.cc)。LOCK 使用现有 POSIX 平台能力，未增加 Windows 支持。
+目录锁为协作式锁；不要在实例存活时删除 LOCK、替换数据库目录或外部修改文件。
 
-KV 主线包含：
+## 本轮检查与验收
 
-- WAL、WriteBatch 与崩溃恢复
-- SkipList MemTable、immutable MemTable 和后台 Flush
-- SSTable、DataBlock、Bloom Filter、Block Cache
-- Manifest、CURRENT 和文件生命周期管理
-- MVCC、Snapshot、范围 Iterator
-- L0/L1/L2 Compaction
-- 并发读写、错误传播、统计信息和测试工具
+新增回归覆盖非法/零配置、路径冲突与失败重试、关闭状态空批次、进程间锁与路径别名、
+并发 Open/Close、零序号 Snapshot、WAL 同步错误后恢复整批、Manifest 不确定发布保留文件、
+长文件编号/孤儿编号、重开缓存、序号重叠/溢出、巨大声明长度及部分非法元数据。
+原 Flush 测试已改为分别等待“发布 SSTable”和“清理 WAL”，二者存在合法异步窗口。
 
-先整理出一个可独立交付的 KV 基线提交，并记录以下基线结果：
+本机 macOS arm64，AppleClang 21.0；最终源码回归结果如下，未观察到 Sanitizer 报告。
+历史冻结基线见 [KV_BASELINE.md](KV_BASELINE.md)。各配置独立构建目录，测试耗时不用于性能比较。
 
-- 干净 checkout 可以完成 Debug 和 Release 构建
-- 默认 CTest 全部通过
-- ASan、UBSan、TSan 构建和测试可以运行
-- 工作区没有构建产物、临时数据库和无关生成文件
-- HNSW 重构代码与 KV 基线分开提交，避免未完成扩展阻塞 KV 发布
+| 配置 | 模式 | CTest | 原始输出 |
+| --- | --- | --- | --- |
+| Debug | 纯 KV | 6/6 | [debug-off](benchmark_results/20261009-kv-boundaries/debug-off.txt) |
+| Release | 扩展开启 | 12/12 | [release-on](benchmark_results/20261009-kv-boundaries/release-on.txt) |
+| ASan + UBSan / Debug | 纯 KV | 6/6 | [asan-off](benchmark_results/20261009-kv-boundaries/asan-off.txt) |
+| ASan + UBSan / Debug | 扩展开启 | 12/12 | [asan-on](benchmark_results/20261009-kv-boundaries/asan-on.txt) |
+| TSan / Debug | 扩展开启，包含全部 KV 回归 | 12/12 | [tsan-on](benchmark_results/20261009-kv-boundaries/tsan-on.txt) |
 
-## 二、修复 API 生命周期语义
+复现默认纯 KV：
 
-重点处理 `DB::Open`、`DB::Close`、读接口和 Snapshot 的状态一致性。
+```bash
+cmake -S . -B build-kv-review -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake --build build-kv-review --parallel
+ctest --test-dir build-kv-review --output-on-failure
+```
 
-- `Close()` 后 `Get`、`NewIterator`、`BruteForceSearch` 等读接口统一返回 `IOError`
-- 未打开或已关闭的 DB 不允许创建 Snapshot
-- 明确 `Close()` 后同一个对象是否允许再次 `Open()`；若允许，必须清理上一生命周期的 Snapshot、后台状态和统计状态
-- 防止跨 DB 使用 Snapshot
-- 对重复 `Open`、重复 `Close`、打开失败后重试、`Close -> Open` 和关闭期间读写补充测试
-- 保证 Iterator 和 Snapshot 的生命周期关系有明确文档
+Release 改 `CMAKE_BUILD_TYPE=Release`；ASan/UBSan 用独立目录加
+`-DKV_SANITIZERS=address,undefined`，TSan 用独立目录加 `-DKV_SANITIZERS=thread`。
+扩展模式另加 `-DKV_ENABLE_VECTOR_EXTENSION=ON`。本地结果不代表远端 CI 已执行。
 
-验收标准：所有公共 API 在打开、关闭、重复打开和失败恢复状态下都有确定的返回值，不依赖未定义的内部状态。
+## 必须保留的失败语义
 
-## 三、补齐 Options 和文件系统错误边界
+成功写入先完成 WAL fsync，再进入 MemTable。错误返回可能发生在写入 WAL 之后或
+MemTable 更新之后，不能据此认定未提交；完整 WAL 可能在重开后恢复出来。
+当前没有通用 KV CommitState API，调用方需要重开读取并使用自身幂等策略确认结果。
 
-增加统一的 `Options` 校验，并保证公共 API 不把底层异常直接抛给调用方。
+当前测试覆盖记录完整性、尾部截断、故障注入、并发时序及分离时的一个进程退出场景。
+进程退出不等于机器断电；没有覆盖所有 SSTable/Manifest/CURRENT 发布点的断电矩阵。
+有 Manifest 时以发布版本为准；Manifest/CURRENT 都缺失时的目录扫描是兼容路径，
+可能纳入孤儿表，不作为任意元数据丢失后的安全恢复保证。
 
-- `memtable_entries_limit`、`block_size`、各层阈值不能为零
-- Bloom Filter 参数、向量相关配置和文件格式边界需要提前校验
-- 数据库路径必须是可用目录，路径冲突和权限错误返回 `Status`
-- `create_directories`、`directory_iterator`、文件删除和重命名等 filesystem 操作统一使用错误码或异常转换
-- 所有配置错误必须在 WAL 写入前返回
+## 一周内执行范围
 
-验收标准：非法配置和无权限目录不会产生半初始化 DB，也不会留下难以判断的异常。
+1. 固定当前源码与构建结果，面试前只修可复现的阻塞问题。
+2. 对齐简历、README 和 [面试核心素材](interview_core.md)，不保留过时接口或目标性能数字。
+3. 准备读写/恢复图、Snapshot 与 tombstone 手推、一个真实并发 bug 和一个失败恢复案例。
+4. HNSW 仅作为附加能力，准备基本搜索、M/ef 参数、精确召回基线和与 KV 的分离边界。
 
-## 四、完成崩溃恢复闭环
+## 后续工程待办
 
-围绕 WAL、SSTable、Manifest 和 CURRENT 建立故障矩阵。
+- 完整 I/O 故障及进程退出/断电发布矩阵，WAL/Manifest/SSTable 解码器模糊测试。
+- 内存分配失败与其他非 filesystem 异常的强边界；当前不承诺所有异常都转 Status。
+- 流式 SSTable Builder、目标文件大小切分、完整 Compaction Picker 与块压缩。
+- immutable 队列背压、大数据与长 Snapshot 内存/空间控制；输出目前全量物化。
+- Snapshot 裸指针句柄管理改进；释放句柄的数量随 DB 对象生命周期累积。
+- 启动孤儿文件清理及删除失败治理；核心不得清理扩展目录或历史侧索引。
+- writer queue、group commit、可配置 durability、Manifest 滚动和长期稳态 Benchmark。
 
-需要覆盖：
-
-- WAL 记录写入中断和尾部截断
-- WAL fsync 后、MemTable 更新前后的进程退出
-- MemTable 切换后、Flush 发布前后的进程退出
-- SSTable 临时文件写入、fsync、rename 前后的进程退出
-- Manifest append 中断
-- CURRENT 替换中断
-- 老 WAL 删除中断
-- Compaction 输出发布前后的进程退出
-
-同时补充：
-
-- WAL sequence 单调性、重复记录和范围校验
-- Manifest sequence 与 WAL sequence 的一致性校验
-- `.tmp`、孤儿 SSTable、孤儿索引文件的启动清理策略
-- 失败后重新打开只能看到已经确认提交的数据
-- Manifest 引用的每个文件都存在且可校验
-
-验收标准：每个发布步骤都能明确回答“崩溃后保留什么、忽略什么、如何继续写入”。
-
-## 五、收紧 WriteBatch 和 Compaction
-
-### WriteBatch
-
-- 保证批次在成功返回前整体可见
-- 处理 WAL 已成功但后续 MemTable 操作失败的情况
-- HNSW 插入失败不能破坏 KV 批次语义
-- 对超大 key、value、batch 和整数边界增加验证
-
-### Compaction
-
-- 保留现有 MVCC、tombstone 和 Snapshot 语义
-- 输出按目标文件大小切分，避免完整结果长期驻留内存
-- 明确 L0/L1/L2 的选择、触发和停止条件
-- 旧文件删除失败时保留可恢复状态并记录明确错误
-- Flush、Compaction、索引文件写出失败时清理临时产物
-- 增加大数据量、长 Snapshot、持续更新和持续删除测试
-
-验收标准：Compaction 的内存占用和文件数量随数据规模可控，失败后不会留下无法解释的持久化状态。
-
-## 六、补充并发和多实例边界
-
-- 同一路径第二个 DB 实例显式拒绝，建议增加目录锁
-- 测试写入、读取、Flush、Compaction 和 Close 的交错时序
-- 测试后台 Flush 失败、Compaction 失败和 WAL 清理失败后的错误传播
-- 用 TSan 覆盖长时间并发读写、后台维护和关闭流程
-- 确认 Iterator、SSTable pin 和旧文件删除之间没有生命周期竞态
-
-验收标准：并发错误不会静默丢数据，后台错误能稳定传递给后续调用方。
-
-## 七、建立 KV 验收门禁
-
-完成后固定执行：
-
-1. 干净 checkout 的 Debug 构建和测试
-2. 干净 checkout 的 Release 构建和测试
-3. ASan + UBSan 测试
-4. TSan 测试
-5. 固定种子压力测试多轮运行
-6. 进程级崩溃恢复测试
-7. WAL、Manifest、SSTable 解码器的模糊测试或随机损坏测试
-8. KV 写入、点查、范围扫描、Compaction 的重复 Benchmark
-9. 工作区和提交内容检查，确保没有生成物和无关文件
-
-KV 主线完成的判定条件：
-
-- 所有上述测试通过
-- Close 后 API 行为一致
-- 同目录多实例有明确拒绝行为
-- 崩溃恢复不丢失已确认写入
-- 失败路径没有持续产生孤儿文件
-- Compaction 在大数据量下不会无界增长内存
-- README、测试、Benchmark 和实际实现口径一致
-
-## 八、HNSW 后续路线
-
-KV 基线完成后，再按独立阶段推进：
-
-1. HNSW 图结构和索引持久化整理
-2. 增量索引维护与 Flush/Compaction 协调
-3. Recall、延迟和构建吞吐的正式 Benchmark
-4. 索引版本回收和并行构建
-5. metadata 过滤、范围条件和混合检索
-6. 百万向量规模验收
-
-每个 HNSW 阶段都需要单独的正确性测试、性能数据和文档，不把目标值当成已完成能力。
-
-## 执行顺序
-
-**仓库整理与当前基线 → KV/HNSW 模块分离及验收 → 生命周期 → Options/异常 → 崩溃恢复 → WriteBatch/Compaction → 并发与多实例 → CI 与验收门禁 → HNSW 独立优化。**
+上述任务按真实需求独立推进。本轮不推进分段 HNSW、并行构图、混合检索或百万向量验收。

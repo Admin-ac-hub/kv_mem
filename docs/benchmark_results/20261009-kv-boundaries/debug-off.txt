@@ -1,0 +1,22 @@
+Test project /Users/ys/cppProject/KV/build-kv-debug
+    Start 1: kv_test
+1/6 Test #1: kv_test ..........................   Passed    3.57 sec
+    Start 2: legacy_compat_test
+2/6 Test #2: legacy_compat_test ...............   Passed    0.37 sec
+    Start 3: core_consumer_test
+3/6 Test #3: core_consumer_test ...............   Passed    0.31 sec
+    Start 4: core_boundary_test
+4/6 Test #4: core_boundary_test ...............   Passed    0.35 sec
+    Start 5: week5_bench_sync_smoke
+5/6 Test #5: week5_bench_sync_smoke ...........   Passed    0.30 sec
+    Start 6: kv_stress_fixed_seed
+6/6 Test #6: kv_stress_fixed_seed .............   Passed    0.50 sec
+
+100% tests passed, 0 tests failed out of 6
+
+Label Time Summary:
+benchmark    =   0.30 sec*proc (1 test)
+core         =   5.40 sec*proc (6 tests)
+stress       =   0.50 sec*proc (1 test)
+
+Total Test time (real) =   5.41 sec

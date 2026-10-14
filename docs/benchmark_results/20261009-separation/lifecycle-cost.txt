@@ -1,0 +1,3 @@
+run=1, vectors=1000, dimension=8, queries=8, open_ms=33.9155, historical_batch_ms=35.3651, current_batch_ms=0.083292
+run=2, vectors=1000, dimension=8, queries=8, open_ms=34.7232, historical_batch_ms=33.705, current_batch_ms=0.051083
+run=3, vectors=1000, dimension=8, queries=8, open_ms=34.1288, historical_batch_ms=33.969, current_batch_ms=0.052583

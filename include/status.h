@@ -27,6 +27,7 @@ class Status {
   bool IsNotFound() const { return code_ == Code::kNotFound; }
   bool IsIOError() const { return code_ == Code::kIOError; }
   bool IsCorruption() const { return code_ == Code::kCorruption; }
+  bool IsInvalidArgument() const { return code_ == Code::kInvalidArgument; }
   std::string ToString() const;
 
  private:

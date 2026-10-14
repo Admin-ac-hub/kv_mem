@@ -88,3 +88,18 @@ ctest --test-dir build-release --output-on-failure
 - [ ] 清理或明确处理无关未跟踪文件
 
 下一步进入目标二：统一 `Open`、`Close`、读接口和 Snapshot 的生命周期语义。
+
+
+## 2026-10-09 分离实现验收补充
+
+分离前工作区 checkpoint：`1da617a`。当前工作区 Debug/Release 基线分别 6/6 通过，
+此前未提交的 HNSWGraph、工具与文档已先由用户提交保护。
+
+KV/HNSW 分离后默认构建纯 KV（kv_core，kvdb alias）；向量入口改为可选 VectorDB。
+两种模式均通过 Debug、Release、ASan+UBSan、TSan：纯 KV 每组 5/5、扩展每组 11/11。
+原混合 kv_test 的 47 个 Test 函数全部保留并分类，另新增故障、生命周期和格式兼容覆盖。
+干净源码验证、实际旧格式 fixture、依赖检查及同条件三轮 benchmark 详见
+[分离验收记录](KV_HNSW_SEPARATION_REPORT.md)。本节不改写前述 289efab 冻结基线。
+
+后续边界修复与当前准备范围见 [KV 主线收尾计划](KV_CLOSURE_PLAN.md)。该计划包含
+新增目录锁、配置/序号/长度校验和持久化失败回归；上述基线与测试数量保留历史口径。

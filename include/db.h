@@ -14,13 +14,11 @@
 #include <vector>
 
 #include "block_cache.h"
-#include "hnsw_index.h"
 #include "manifest.h"
 #include "memtable.h"
 #include "sstable.h"
 #include "status.h"
 #include "types.h"
-#include "vector_value.h"
 #include "wal.h"
 #include "write_batch.h"
 
@@ -35,18 +33,15 @@ struct Options {
   size_t block_size = 4096;
   size_t block_cache_capacity = 64;
   size_t bloom_bits_per_key = 10;
-  size_t vector_dimension = 0;
-  size_t hnsw_max_neighbors = 16;
-  size_t hnsw_ef_construction = 200;
-  VectorDistanceMetric vector_distance_metric = VectorDistanceMetric::kL2;
   bool create_if_missing = true;
   bool error_if_exists = false;
   bool testing_fail_flush = false;
   bool enable_event_log = false;
   std::function<void()> testing_after_read_version_pin = {};
   std::function<void()> testing_before_compaction_publish = {};
-  // Byte budget for L1, independent of entry count and vector dimension.
-  // Appended to preserve the order of existing aggregate initializers.
+  std::function<Status()> testing_before_wal_sync = {};
+  std::function<Status()> testing_before_manifest_sync = {};
+  // Byte budget for L1, independent of entry count and value size.
   std::uint64_t level1_size_limit_bytes = 64ULL * 1024 * 1024;
 };
 
@@ -74,6 +69,7 @@ class Snapshot {
   explicit Snapshot(SequenceNumber sequence) : sequence_(sequence) {}
 
   SequenceNumber sequence_ = 0;
+  bool active_ = true;
 
   friend class DB;
 };
@@ -109,45 +105,20 @@ class DB {
   Status Close();
   Status Write(const WriteBatch& batch);
   Status Put(const std::string& key, const std::string& value);
-  Status PutVector(const std::string& key,
-                   const std::vector<float>& vector,
-                   const std::string& metadata = {});
   Status Get(const std::string& key,
              std::string* value,
              const ReadOptions& options = {});
-  Status GetVector(const std::string& key,
-                   VectorRecord* record,
-                   const ReadOptions& options = {});
-  Status BruteForceSearch(
-      const std::vector<float>& query,
-      size_t top_k,
-      std::vector<VectorResult>* results,
-      VectorDistanceMetric metric = VectorDistanceMetric::kL2,
-      const ReadOptions& options = {});
-  Status Search(const std::vector<float>& query,
-                size_t top_k,
-                size_t ef_search,
-                std::vector<VectorResult>* results,
-                const ReadOptions& options = {});
-  Status Search(const std::vector<float>& query,
-                size_t top_k,
-                std::vector<VectorResult>* results,
-                const ReadOptions& options = {});
-  Status SearchBatch(const std::vector<std::vector<float>>& queries,
-                     size_t top_k,
-                     size_t ef_search,
-                     std::vector<std::vector<VectorResult>>* results,
-                     const ReadOptions& options = {});
   Status Delete(const std::string& key);
   Status Compact();
   DBStats Stats() const;
-  // Explicit O(nodes + edges) inspection; avoids slowing the lightweight Stats().
-  HNSWStats VectorIndexStats() const;
   const Snapshot* GetSnapshot();
   void ReleaseSnapshot(const Snapshot* snapshot);
   std::unique_ptr<Iterator> NewIterator(const ReadOptions& options = {});
 
  private:
+  Status OpenUnlocked();
+  void ReleaseDirectoryLock();
+  Status AllocateFileNumber(std::uint64_t* number);
   struct ImmutableMemTable {
     std::shared_ptr<MemTable> memtable;
     std::uint64_t wal_file_number = 0;
@@ -155,17 +126,6 @@ class DB {
 
   Status LoadOrRecoverManifest();
   Status OpenSSTables();
-  Status RebuildVectorIndex();
-  Status AddVectorIndexEntry(const VersionedEntry& entry);
-  Status AddVectorIndexEntryTo(const std::shared_ptr<HNSWIndex>& index,
-                               const VersionedEntry& entry) const;
-  Status BuildVectorIndexForCompaction(
-      const std::vector<VersionedEntry>& output,
-      const std::set<std::uint64_t>& input_numbers,
-      const std::vector<std::shared_ptr<SSTable>>& tables,
-      std::shared_ptr<HNSWIndex>* rebuilt) const;
-  Status SaveVectorIndexEntries(const std::vector<VersionedEntry>& entries,
-                                const std::filesystem::path& path) const;
   Status Recover();
   Status MaybeFlushMemTable();
   Status FlushMemTable();
@@ -179,11 +139,11 @@ class DB {
   Status MaybeCompact();
   Status CompactUnlocked();
   SequenceNumber ReadSequence(const ReadOptions& options) const;
+  Status ValidateReadOptions(const ReadOptions& options) const;
   SequenceNumber MinActiveSnapshotSequence() const;
   Status SaveManifest();
   void LogEvent(const std::string& message) const;
   std::filesystem::path SSTablePath(std::uint64_t number) const;
-  std::filesystem::path HNSWIndexPath(std::uint64_t number) const;
   std::filesystem::path WALPath(std::uint64_t number) const;
 
   Options options_;
@@ -191,7 +151,6 @@ class DB {
   std::uint64_t active_wal_file_number_ = 1;
   std::uint64_t active_memtable_oldest_wal_file_number_ = 1;
   std::shared_ptr<MemTable> active_memtable_;
-  std::shared_ptr<HNSWIndex> vector_index_;
   std::deque<ImmutableMemTable> immutable_memtables_;
   std::vector<std::shared_ptr<SSTable>> sstables_;
   std::unique_ptr<Manifest> manifest_;
@@ -205,7 +164,11 @@ class DB {
   bool background_stop_ = false;
   bool background_work_pending_ = false;
   bool closed_ = true;
+  int directory_lock_fd_ = -1;
+  std::uint64_t lifecycle_generation_ = 0;
   Status background_status_;
+  // Serialize Open/Close across the worker join without blocking the worker.
+  mutable std::mutex lifecycle_mu_;
   mutable std::mutex write_mu_;
   mutable std::mutex compaction_mu_;
   mutable std::mutex version_mu_;

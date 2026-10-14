@@ -1,0 +1,7 @@
+OFF compile commands: no vector/HNSW sources
+OFF libkv_core.a: no HNSW/vector encoding/distance symbols
+
+hnsw_test: /usr/bin/c++ -O3 -DNDEBUG -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/hnsw_test.dir/test/hnsw_test.cc.o -o hnsw_test  libhnsw.a libvector_value.a libkv_common.a
+vector_value_test: /usr/bin/c++ -O3 -DNDEBUG -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/vector_value_test.dir/test/vector_value_test.cc.o -o vector_value_test  libvector_value.a libkv_common.a
+core_consumer_test: /usr/bin/c++ -O3 -DNDEBUG -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/core_consumer_test.dir/test/core_consumer_test.cc.o -o core_consumer_test  libkv_core.a libkv_common.a
+vector_db_test: /usr/bin/c++ -O3 -DNDEBUG -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/vector_db_test.dir/test/vector_db_test.cc.o -o vector_db_test  libvector_db.a libkv_core.a libhnsw.a libvector_value.a libkv_common.a

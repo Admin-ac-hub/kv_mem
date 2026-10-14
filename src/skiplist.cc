@@ -92,8 +92,8 @@ void SkipList::Insert(std::string key,
   ++size_;
 }
 
-std::optional<SkipList::Entry> SkipList::Get(const std::string& key,
-                                             SequenceNumber read_sequence) const {
+std::optional<Entry> SkipList::Get(const std::string& key,
+                                   SequenceNumber read_sequence) const {
   Node* candidate = FindGreaterOrEqual(EncodeInternalKey(key, read_sequence), nullptr);
   if (candidate == nullptr) {
     return std::nullopt;
