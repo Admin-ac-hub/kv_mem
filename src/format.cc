@@ -13,17 +13,17 @@ namespace kv {
 namespace {
 
 bool ParseNumberedName(const std::filesystem::path& path,
-                       const std::string& prefix,
-                       const std::string& suffix,
+                       std::string_view prefix,
+                       std::string_view suffix,
                        std::uint64_t* number) {
   const std::string name = path.filename().string();
   if (name.size() < prefix.size() + 6 + suffix.size() ||
-      name.rfind(prefix, 0) != 0 ||
-      name.substr(name.size() - suffix.size()) != suffix) {
+      !name.starts_with(prefix) || !name.ends_with(suffix)) {
     return false;
   }
 
-  const std::string digits = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+  const std::string_view digits = std::string_view(name).substr(
+      prefix.size(), name.size() - prefix.size() - suffix.size());
   if (!std::all_of(digits.begin(), digits.end(),
                    [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
     return false;

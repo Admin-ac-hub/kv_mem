@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Admin-ac-hub/kv_mem/actions/workflows/ci.yml/badge.svg)](https://github.com/Admin-ac-hub/kv_mem/actions/workflows/ci.yml)
 
-Mini LSM-KV 是一个基于 C++17 实现的单机持久化 KV 存储引擎。项目采用 LSM-Tree 架构，覆盖从 WAL、MemTable、SSTable 到 Manifest、崩溃恢复和分层 Compaction 的完整数据生命周期，并实现 MVCC Snapshot、范围扫描、缓存与数据完整性校验。
+Mini LSM-KV 是一个基于 C++20 实现的单机持久化 KV 存储引擎。项目采用 LSM-Tree 架构，覆盖从 WAL、MemTable、SSTable 到 Manifest、崩溃恢复和分层 Compaction 的完整数据生命周期，并实现 MVCC Snapshot、范围扫描、缓存与数据完整性校验。
 
 除核心引擎外，仓库还提供自动化测试、随机压力测试、Sanitizer CI 和 benchmark，用于验证并发正确性、持久化语义与读写性能。
 
@@ -19,11 +19,11 @@ Mini LSM-KV 是一个基于 C++17 实现的单机持久化 KV 存储引擎。项
 | 数据校验 | WAL record、Manifest record 和 SSTable DataBlock CRC32 校验 |
 | 工程验证 | 单元测试、并发随机压力测试、ASan/UBSan/TSan CI、可复现 benchmark |
 
-### 可选向量检索扩展
+### miniRPC 服务
 
-默认构建只提供纯 KV。显式启用 `KV_ENABLE_VECTOR_EXTENSION=ON` 后，
-`VectorDB` 组合 KV 与独立 HNSW 索引，提供向量读写、精确 Top-K、近似搜索和
-历史 Snapshot 搜索。KV 核心不解析向量，也不访问或维护索引文件。
+纯 KV 引擎可选链接相邻项目 miniRPC，提供单节点远程 `Get/Put/Delete/Write`。
+RPC 采用独立适配层，支持二进制 value、原子批次、明确的业务错误与写入结果状态。
+2026-11-04 起移除 HNSW/VectorDB 的源码、构建目标及测试；原始设计和实验报告保留为历史记录。
 
 ## 系统架构
 
@@ -85,7 +85,17 @@ Recovery path
 
 ### 写入与原子提交
 
-`Put` 和 `Delete` 统一转换为 `WriteBatch`。每个非空 batch 在提交时获得连续的 sequence number，并编码为一条带 CRC 的 WAL batch record。WAL append 和 fsync 成功后再更新 MemTable；读视图在整批更新完成后取得，恢复也以完整记录为单位解码和重放。
+`Put` 和 `Delete` 统一转换为 `WriteBatch`。并发请求进入 FIFO writer queue，由组首线程合并已经排队的完整批次，共用一次带 CRC 的 WAL batch record 和 fsync。不主动等待攒批；没有并发请求时仍立即提交原批次。WAL append 和 fsync 成功后再更新 MemTable；每个操作获得连续的 sequence number，读视图在整组更新完成后取得，恢复也以完整记录为单位解码和重放。
+
+`Options::enable_write_grouping` 默认 `true`，设为 `false` 后每次只提交一个原始请求；两种模式都保持同步持久化。`write_group_max_bytes` 默认 1 MiB，必须大于零，限制合并后的操作编码 payload（不含 WAL header）；大于上限的合法原始批次单独提交，不会拆分。非法请求在入队前独立拒绝。`Close` 停止接收新写入，等待已接收请求完成后再关闭文件和后台线程。
+
+`DBStats` 中 `wal_sync_count`、`wal_committed_operations` 和 `max_wal_batch_operations` 统计当前对象一生中成功同步到 WAL 的次数、操作数和最大批次操作数，跨 WAL 切换及 Close/Open 累计；空批次和恢复重放不计数。同步后的维护失败不会撤销这些 WAL 统计。
+
+设计参考 [LevelDB 同步批量写入](https://github.com/google/leveldb/blob/main/doc/index.md)。并发与故障回归、基准方法和实测结果见 [自动批量提交报告](docs/GROUP_COMMIT_REPORT.md)。
+
+2026-10-14 的七轮实测中，4/8 线程 KV 前台吞吐为旧实现的 2.08/3.15 倍，包含 Close 后为
+1.48/1.56 倍，真实请求 P99 增加。这些测量早于 2026-11-07 的 SkipList 原子发布及去锁改动，
+不能用来量化本次去锁的收益；报告中的向量实验属于已退役扩展的历史数据。
 
 WAL 读写统一使用 batch 格式，不支持没有 batch envelope 的旧单操作记录。读取到完整但不匹配的 magic 时返回 `Corruption`。
 
@@ -132,18 +142,44 @@ Compaction 会清理被覆盖的历史版本，但必须保留活跃 Snapshot �
 
 ### 并发模型
 
-引擎使用职责分离的锁控制共享状态：
+2026-11-07 起已移除 `write_mu_` 和 `memtable_mu_`。每个 DB 的线程锁共 6 把：
+DB 直接声明 4 把，内部 WriteQueue 与 BlockCache 各 1 把。目录 `flock` 另计。
 
 | 锁 | 保护范围 |
 | --- | --- |
-| `write_mu_` | WAL append、sequence 分配和写入顺序 |
-| `memtable_mu_` | active/immutable MemTable 的并发访问 |
+| WriteQueue `mu_` | 写入准入、选出唯一提交组首、完成通知 |
 | `version_mu_` | Manifest、SSTable 版本与 Snapshot 列表 |
 | `bg_mu_` | 后台 Flush/Compaction 的唤醒和停止状态 |
 | `compaction_mu_` | 串行化公开与后台 Compaction |
 | `lifecycle_mu_` | 串行化 Open/Close，包括后台线程 join 阶段 |
+| BlockCache `mutex_` | 缓存内容、LRU 顺序与缓存统计 |
 
-读取在拿到 MemTable 和 SSTable 版本快照后释放全局版本锁，SSTable I/O 不长期占用 DB 状态锁。读请求通过 `shared_ptr` pin 当前 SSTable 版本，因此 Compaction 发布新版本并删除旧文件时，已经开始的读取仍可安全完成。`Close()` 会停止后台线程并 drain 未完成的 immutable MemTable，确保资源释放与目录清理之间没有竞态。
+WriteQueue 保证同一时刻只有一个组首执行提交，关闭 grouping 后也保持串行提交。组首在释放队列锁后完成 WAL append、sequence 分配与 MemTable 更新，因此不再需要额外的 `write_mu_`。`Close()` 先停止写入准入并排空队列，再关闭文件和切换内存状态。
+
+一次操作涉及的不同显式锁对象如下；同一把锁重复获取只算一把，各阶段并非同时持锁：
+
+| 路径 | 锁数量 | 涉及的锁 |
+| --- | ---: | --- |
+| 普通 Get，内存表命中 | 0 | 原子固定 Version、读取序号和遍历节点 |
+| 普通 Get，访问 SSTable 数据块 | 1 | BlockCache `mutex_`；范围或 Bloom 排除时可不访问缓存 |
+| 带 Snapshot 的 Get | 1–2 | 增加 `version_mu_` 校验句柄 |
+| 常规写入的提交组首 | 2 | WriteQueue `mu_`、`version_mu_` |
+| 写入触发 MemTable 切换 | 3 | 再加 `bg_mu_` 通知后台 |
+
+合并组内的跟随请求由组首代为提交，跟随线程只参与写队列同步。
+
+写入先完成 WAL 同步和整批 MemTable 插入，再用一次 Release store 发布原子的 `last_sequence_`。普通 Get/NewIterator 以 Acquire 读取序号，并原子 pin 一个不可变 `Version`；Version 一起保存 active/immutable MemTable、SSTable 和对应范围元数据，取得视图不再逐表复制引用。若取序号期间 Version 已切换，则重新取视图，避免序号与数据来源不一致。
+
+SkipList 支持一个外部串行化的写者与多个并发读者：节点的 key/value 和全部后继指针初始化后，按从底层到高层的顺序用 Release store 发布，读者用 Acquire load 遍历。高度与节点计数也使用原子变量。相同 internal key 的覆盖通过新节点替换，旧节点保留到整张表销毁；读请求固定的 Version 保证 MemTable 生命周期。因此无需 `memtable_mu_`，普通 Get/NewIterator 也不获取 `version_mu_`，WAL/MANIFEST 同步和节点插入不会通过这两把锁阻塞普通读取。Snapshot 句柄管理和校验仍使用版本锁，数据块访问仍使用缓存锁；原子 shared_ptr 操作不承诺在所有平台上无锁。
+
+单写者由队列协议保证，发布指针使用 store，无需 CAS；多个写者直接并发修改同一 SkipList 不在契约内。
+节点发布只保证读者看到完整节点，整组可见性仍由批末 `last_sequence_` 的 Release/Acquire 同步保证。
+
+Compaction 先持久化 MANIFEST，再发布新 Version；旧读持有 Version 和 SSTable fd，旧路径删除后仍可完成。`Close()` 会停止后台线程并 drain 未完成的 immutable MemTable。
+
+去锁回归覆盖半批安装时的旧视图、相同 internal key 的并发替换、多写线程与 Snapshot/Iterator、
+切表和关闭排空。2026-11-07 本机 Debug、Release、ASan/UBSan、TSan 均 8/8 通过，
+证据见 [当前验收记录](docs/KV_CLOSURE_PLAN.md#2026-11-07-原子发布与去锁验证)。本次未做吞吐对比。
 
 ## 文件布局
 
@@ -163,6 +199,7 @@ sst_000005.data
 ```text
 include/    public headers
 src/        storage engine implementation
+rpc/        optional miniRPC adapter, protocol, client/server and integration test
 test/       deterministic unit and concurrency tests
 stress/     randomized concurrent model-based stress test
 bench/      benchmark workloads
@@ -173,7 +210,7 @@ docs/       design notes and benchmark analysis
 
 ## 构建与测试
 
-依赖 CMake 3.16+ 和支持 C++17 的编译器。
+依赖 CMake 3.16+ 和支持 C++20 的编译器。
 
 ```bash
 cmake -S . -B build \
@@ -193,22 +230,41 @@ cmake --build build-sanitized --parallel
 ctest --test-dir build-sanitized --output-on-failure
 ```
 
-GitHub Actions 分别构建纯 KV 和向量扩展，在 Ubuntu/macOS 运行 Debug/Release
-及 ASan/UBSan，并在 Ubuntu 运行 TSan。核心目标为 `kv_core`，`kvdb` 是它的
-CMake alias；直接链接静态库的调用方应迁移到 `libkv_core` 和 `libkv_common`。
+GitHub Actions 在 Ubuntu/macOS 运行纯 KV Debug/Release、ASan/UBSan，并在
+Ubuntu 运行 TSan。核心目标为 `kv_core`，`kvdb` 是它的 CMake alias。
+RPC 使用 Linux epoll/eventfd，默认 `KV_ENABLE_RPC=OFF`；开启后额外依赖 miniRPC 与 Protobuf。
 
-启用向量扩展：
+## miniRPC 远程服务
+
+在 Linux 中先安装 miniRPC，再构建当前项目（以下从 KV 仓库根目录执行）：
 
 ```bash
-cmake -S . -B build-vector -DCMAKE_BUILD_TYPE=Release \
-  -DKV_ENABLE_VECTOR_EXTENSION=ON
-cmake --build build-vector --parallel
-ctest --test-dir build-vector --output-on-failure
+cmake -S ../miniRPC -B ../miniRPC/build -DCMAKE_BUILD_TYPE=Release
+cmake --build ../miniRPC/build --parallel
+cmake --install ../miniRPC/build --prefix /tmp/minirpc-prefix
+
+cmake -S . -B build-rpc -DCMAKE_BUILD_TYPE=Debug \
+  -DKV_ENABLE_RPC=ON -DCMAKE_PREFIX_PATH=/tmp/minirpc-prefix
+cmake --build build-rpc --parallel
+ctest --test-dir build-rpc --output-on-failure
 ```
 
-算法测试/探针只链接 `hnsw`（依赖 `vector_value` 和基础工具 `kv_common`），
-不链接 KV。`KV_ENABLE_SIMD` 和 `KV_HNSW_DISTANCE_COUNTER` 只影响扩展目标。
-`KV_ENABLE_RECALL_REGRESSION=ON` 要求同时启用扩展。
+启动服务及调用（客户端在另一个终端执行）：
+
+```bash
+./build-rpc/rpc/kv_server ./rpc_db 127.0.0.1 9000
+./build-rpc/rpc/kv_client 127.0.0.1 9000 put user:1 alice
+./build-rpc/rpc/kv_client 127.0.0.1 9000 get user:1
+./build-rpc/rpc/kv_client 127.0.0.1 9000 write put user:2 bob delete user:1
+```
+
+服务接收 SIGINT/SIGTERM 后先停止接收请求并等待 handler 收尾，再关闭 DB。
+客户端 CLI 的 `write` 将所有操作作为一次原子批次提交。C++ API 支持任意二进制 value；
+命令行参数不能表达 NUL 字节。
+
+本机 macOS 可使用已有 `minirpc-linux` 容器运行 `./scripts/run_rpc_checks.sh`；
+脚本不创建容器，保留 Linux 构建位置并输出后续启动命令。
+协议、限制、故障语义与验证方法见 [miniRPC 接入说明](docs/MINIRPC_INTEGRATION.md)。
 
 ## 随机压力测试
 
@@ -320,91 +376,23 @@ Iterator 和 Snapshot 都应在 DB 销毁前释放。
 
 当前已验证边界、未完成项目和面试材料入口见 [KV 主线收尾计划](docs/KV_CLOSURE_PLAN.md)。
 
-## 向量 API 迁移与一致性
-
-旧 `DB::PutVector/GetVector/BruteForceSearch/Search/SearchBatch/VectorIndexStats`
-移到 `VectorDB`；`WriteBatch::PutVector` 改为 `VectorWriteBatch::PutVector`。
-KV 配置放在 `VectorOptions::kv_options`，向量维度、度量和 HNSW 参数直接放在
-`VectorOptions`。`Options` 不再包含向量字段，聚合初始化调用方需要检查参数位置。
-
-```cpp
-#include "vector_db.h"
-
-int main() {
-  kv::VectorOptions options;
-  options.kv_options.db_path = "./vector_example";
-  options.vector_dimension = 3;
-  kv::VectorDB db(options);
-  if (!db.Open().ok()) return 1;
-
-  kv::VectorWriteBatch batch;
-  batch.Put("description", "example");
-  if (!batch.PutVector("v1", {1, 0, 0}, "metadata").ok()) return 1;
-  const auto write = db.Write(batch);
-  if (!write.ok()) {
-    // Inspect commit_state, kv_status and index_status before deciding to retry.
-    // Committed means all KV operations are stored, even if the index failed.
-    return 2;
-  }
-  std::vector<kv::VectorResult> results;
-  if (!db.Search({1, 0, 0}, 10, &results).ok()) return 3;
-  return db.Close().ok() ? 0 : 4;
-}
-```
-
-应用链接 `vector_db`。扩展不暴露可写底层 DB；同一实例的写入必须经过扩展。
-批次提交前校验 key、编码、维度、有限值和度量；新向量按普通 Put 写入 WAL。
-扩展用协调锁覆盖整批 KV 提交与索引更新，查询不会看到半批次。
-带 `KVV1` 魔数的普通 Put 在扩展中也按向量校验并索引，保证重开前后解释一致；
-纯 KV 接受任意字节，包括语义错误的向量值。
-
-`Write` 和 `PutVector` 返回 `VectorWriteResult`：
-
-| commit_state | 含义与处理 |
-| --- | --- |
-| `NotCommitted` | 提交前拒绝；检查 `kv_status`，该调用没有写 WAL |
-| `Committed` | KV 成功；`index_status` 失败表示索引 Dirty，数据已提交 |
-| `Unknown` | 底层 KV 错误使提交结果无法确定；不能据此假设数据未写入 |
-
-Dirty 状态下 `Search/SearchBatch` 返回索引不可用错误并清空结果；`Get`、
-`GetVector`、Iterator 和 `BruteForceSearch` 仍从 KV 读取。显式 `RebuildIndex()`
-从一致 KV 视图构建新图，成功后恢复 Ready。KV 仍可写时，Dirty 期间可继续提交批次，
-结果明确表达“KV 已提交，索引不可用”。底层 KV 持久化错误需要 Close/Open 确认恢复；
-单独重建索引不会清除 KV 的写入错误。普通 `Put/Delete` 保留 `Status` 返回约定；
-其提交后失败消息包含 `KV committed`，需要结构化提交结果时使用 `Write`。
-
-当前视图使用维护中的图；历史 Snapshot 搜索从该 Snapshot 的 Iterator 构建
-临时图，`SearchBatch` 复用一次构图。历史搜索成本随该视图的向量数增长。
-`index_rebuild_operations` 默认每 4096 次操作重建以回收旧节点与 tombstone，
-设为 0 可关闭自动回收；回收与 KV Compaction 独立。重建阻止扩展写入，后台
-KV Flush/Compaction 可以继续。
-
-Snapshot 必须来自同一 DB、仍未释放且属于当前 Open 周期。Close 后快照失效，
-可重复 Close 和重新 Open。释放的 Snapshot 小句柄保留到 DB 销毁，以防原始
-指针地址重用；它们不再保留 KV 历史版本。Iterator/快照应在其 DB 销毁前释放。
-
-磁盘迁移保持 WAL envelope、SSTable 和向量 value 布局；旧批次类型 3 作为普通
-Put 解码，旧 Manifest 索引字段校验后忽略。旧 `index_*.hnsw` 保留原地，不读取、
-更新或自动删除；首版每次 Open 从 KV 重建，不生成新索引文件。
-兼容样本、双模式测试与性能口径见
-[分离验收记录](docs/KV_HNSW_SEPARATION_REPORT.md)。旧二进制回退请使用备份，
-小规模反向读取实验不构成通用双向兼容承诺。
-
 ## 当前边界
 
 - 单实例读写引擎，同一路径的第二个协作实例通过目录锁拒绝；不支持多个实例共享写入。
 - Compaction 尚未实现完整的 level score、grandparent overlap 控制和多文件输出切分。
 - Compaction 输入端已流式归并，输出端仍会先构建内存 vector 再生成 SSTable。
-- 每个 WriteBatch 默认执行一次 WAL fsync，尚未实现 writer queue、group commit 和可配置 durability。
+- 写入始终同步持久化；低并发下自动合并机会有限，尚无异步 durability 策略。
 - DataBlock 已保留编码类型，但当前只写入原始 payload，尚未接入 Snappy 或 Zstd。
 - immutable 队列尚无完整背压；Compaction 输出全量物化，慢维护和长 Snapshot 仍可能增加内存与空间占用。
 - 已覆盖恢复与故障注入场景，完整发布点断电矩阵、解码器模糊测试和长期稳态验证仍未完成。
-- 可选向量扩展的 HNSW 图不持久化，重启需要完整重建；历史 Snapshot 搜索需要临时构图。
+- RPC 为单节点服务，尚无 Raft、复制、分片、请求去重、TLS 或鉴权；默认绑定 loopback。
+- RPC 单 value 上限 1 MiB、序列化请求 payload 上限 1.5 MiB、单批次最多 4096 操作；本地 DB 不受这些 RPC 限制。
+- 写入超时或底层 I/O 错误可能对应已提交数据；客户端不自动重放写入。
 
 ## 后续方向
 
 - 实现按 level score 和文件 overlap 选择输入的 Compaction Picker。
 - 增加流式 SSTable Builder 和目标文件大小控制。
-- 实现 writer queue、group commit 与可配置同步策略。
+- 增加可配置同步策略，并评估持续写入时的维护背压。
 - 接入 Snappy/Zstd，对比压缩率、CPU 开销与缓存命中率。
 - 增加进程异常退出、I/O 故障注入和长时间稳定性测试。

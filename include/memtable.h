@@ -15,6 +15,8 @@ namespace kv {
 // that users of MemTable (DB included) never depend on the skiplist internals.
 class SkipList;
 
+// One externally serialized writer may overlap Get/Entries/Size calls. The
+// owning Version keeps this table and its nodes alive until readers finish.
 class MemTable {
  public:
   MemTable();

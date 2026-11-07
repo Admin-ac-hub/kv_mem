@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -12,6 +13,9 @@
 
 namespace kv {
 
+// Writes must be externally serialized. Readers may run concurrently with the
+// writer; destruction requires all accesses to have finished. Published node
+// keys/values never change, and nodes are reclaimed only with the whole table.
 class SkipList {
  public:
   SkipList();
@@ -30,14 +34,16 @@ class SkipList {
   void Clear();
 
   struct Node {
-    std::string internal_key;
-    Entry entry;
-    std::vector<Node*> next;
+    const std::string internal_key;
+    const Entry entry;
+    std::vector<std::atomic<Node*>> next;
 
     Node(std::string internal_key_in, Entry entry_in, int level)
         : internal_key(std::move(internal_key_in)),
           entry(std::move(entry_in)),
-          next(static_cast<size_t>(level), nullptr) {}
+          next(static_cast<size_t>(level)) {
+      for (auto& link : next) link.store(nullptr, std::memory_order_relaxed);
+    }
   };
 
   static constexpr int kMaxLevel = 12;
@@ -52,9 +58,13 @@ class SkipList {
                            std::vector<Node*>* prev) const;
 
   Node head_;
-  int level_;
-  size_t size_ = 0;
-  mutable std::mt19937 rng_;
+  // Height is only a search hint; observing an older height is safe.
+  std::atomic<int> level_;
+  std::atomic<size_t> size_{0};
+  std::mt19937 rng_;
+  // Replacing an identical internal key must keep the old payload alive for
+  // readers already holding that node. DB sequences normally avoid this path.
+  std::vector<std::unique_ptr<Node>> retired_nodes_;
 };
 
 }  // namespace kv

@@ -7,8 +7,7 @@
 #   scripts/docker_test.sh image               (re)build the toolchain image
 #   scripts/docker_test.sh shell               interactive shell in /work
 #
-# The container is linux/arm64, matching the development host, so the distance
-# kernel selects NEON. Source is bind-mounted read-only at /src; build output
+# Source is bind-mounted read-only at /src; build output
 # lives in the named volume kv-test-build, which survives across invocations and
 # keeps object files off the macOS bind mount.
 
@@ -28,7 +27,6 @@ IMAGE="${KV_TEST_IMAGE:-kv-test:ubuntu24}"
 BUILD_VOLUME="${KV_TEST_BUILD_VOLUME:-kv-test-build}"
 DOCKERFILE="${REPO_ROOT}/docker/Dockerfile.test"
 BUILD_TYPE="${KV_TEST_BUILD_TYPE:-Release}"
-VECTOR_EXTENSION="${KV_TEST_VECTOR_EXTENSION:-OFF}"
 
 run_in_container() {
   "${DOCKER}" run --rm \
@@ -56,10 +54,10 @@ configure_and_build() {
     set -euo pipefail
     if [[ ! -f /work/CMakeCache.txt ]]; then
       echo '== configure =='
-      cmake -S /src -B /work -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTING=ON -DKV_ENABLE_VECTOR_EXTENSION=${VECTOR_EXTENSION}
+      cmake -S /src -B /work -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTING=ON
     else
       echo '== reconfigure (existing cache) =='
-      cmake -S /src -B /work -DKV_ENABLE_VECTOR_EXTENSION=${VECTOR_EXTENSION}
+      cmake -S /src -B /work
     fi
     echo '== build =='
     if [[ \$# -eq 0 ]]; then

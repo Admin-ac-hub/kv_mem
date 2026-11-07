@@ -2,6 +2,8 @@
 
 日期：2026-10-08
 
+> 历史基线：本文记录指定 revision 的接口、锁模型和测试数量。当前 KV 已实现 WriteQueue/group commit，2026-11-07 又移除 `write_mu_`、`memtable_mu_`，改为单写者原子节点发布；当前 6 把线程锁和 8 项测试见 [README 并发模型](../README.md#并发模型) 与 [当前验收记录](KV_CLOSURE_PLAN.md#2026-11-07-原子发布与去锁验证)。下文的“当前工作区”“下一步”均指当时状态。
+
 ## 基线版本
 
 - Git revision：`289efab` (`fix(ci): avoid libatomic dependency in week5_bench`)

@@ -69,9 +69,6 @@ Status WALWriter::AppendBatch(const WriteBatch& batch, SequenceNumber sequence) 
   }
 
   const std::string payload = batch.Encode();
-  if (payload.size() > std::numeric_limits<std::uint32_t>::max()) {
-    return Status::InvalidArgument("WriteBatch payload is too large");
-  }
 
   std::string header;
   header.reserve(kBatchHeaderWithoutMagicSize);

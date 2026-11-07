@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <condition_variable>
 #include <deque>
@@ -8,12 +9,12 @@
 #include <memory>
 #include <mutex>
 #include <set>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "block_cache.h"
+#include "internal_write_queue.h"
 #include "manifest.h"
 #include "memtable.h"
 #include "sstable.h"
@@ -37,7 +38,12 @@ struct Options {
   bool error_if_exists = false;
   bool testing_fail_flush = false;
   bool enable_event_log = false;
+  bool enable_write_grouping = true;
+  size_t write_group_max_bytes = 1024 * 1024;
+  // Notification under the queue mutex: must not block, throw or reenter DB.
+  std::function<void()> testing_after_write_enqueue = {};
   std::function<void()> testing_after_read_version_pin = {};
+  std::function<void()> testing_before_sequence_publish = {};
   std::function<void()> testing_before_compaction_publish = {};
   std::function<Status()> testing_before_wal_sync = {};
   std::function<Status()> testing_before_manifest_sync = {};
@@ -59,6 +65,11 @@ struct DBStats {
   std::uint64_t block_restart_seeks = 0;
   // Counts successfully published flushes over this DB object's lifetime.
   std::uint64_t flush_count = 0;
+  // Successful WAL fsyncs/operations over this object's lifetime, including
+  // WAL rotations and Close/Open. Replay and empty writes are not counted.
+  std::uint64_t wal_sync_count = 0;
+  std::uint64_t wal_committed_operations = 0;
+  std::uint64_t max_wal_batch_operations = 0;
 };
 
 class Snapshot {
@@ -117,12 +128,30 @@ class DB {
 
  private:
   Status OpenUnlocked();
+  Status WriteGroup(const WriteBatch& batch);
   void ReleaseDirectoryLock();
   Status AllocateFileNumber(std::uint64_t* number);
   struct ImmutableMemTable {
     std::shared_ptr<MemTable> memtable;
     std::uint64_t wal_file_number = 0;
   };
+
+  // Published instances never change. MemTables support one writer and
+  // concurrent readers, with nodes retained for the table's lifetime.
+  struct Version {
+    struct Table {
+      std::shared_ptr<SSTable> table;
+      SSTableMeta meta;
+    };
+    std::shared_ptr<MemTable> active;
+    std::vector<std::shared_ptr<MemTable>> immutables;
+    std::vector<Table> sstables;
+  };
+
+  void PublishVersion(std::shared_ptr<const Version> version);
+  Status PinReadVersion(const ReadOptions& options,
+                       std::shared_ptr<const Version>* version,
+                       SequenceNumber* sequence) const;
 
   Status LoadOrRecoverManifest();
   Status OpenSSTables();
@@ -138,7 +167,6 @@ class DB {
   void SetBackgroundErrorLocked(Status status);
   Status MaybeCompact();
   Status CompactUnlocked();
-  SequenceNumber ReadSequence(const ReadOptions& options) const;
   Status ValidateReadOptions(const ReadOptions& options) const;
   SequenceNumber MinActiveSnapshotSequence() const;
   Status SaveManifest();
@@ -152,13 +180,23 @@ class DB {
   std::uint64_t active_memtable_oldest_wal_file_number_ = 1;
   std::shared_ptr<MemTable> active_memtable_;
   std::deque<ImmutableMemTable> immutable_memtables_;
-  std::vector<std::shared_ptr<SSTable>> sstables_;
+  // version_mu_ protects metadata changes; ordinary reads only pin read_version_.
+  std::shared_ptr<const Version> version_;
+  // Access only through the shared_ptr atomic load/store functions.
+  std::shared_ptr<const Version> read_version_;
+  std::atomic<SequenceNumber> last_sequence_{0};
   std::unique_ptr<Manifest> manifest_;
   std::shared_ptr<BlockCache> block_cache_;
   std::vector<std::unique_ptr<Snapshot>> snapshots_;
   std::uint64_t compaction_count_ = 0;
   std::uint64_t flush_count_ = 0;
   std::uint64_t sstable_full_scans_ = 0;
+  std::uint64_t wal_sync_count_ = 0;
+  std::uint64_t wal_committed_operations_ = 0;
+  std::uint64_t max_wal_batch_operations_ = 0;
+  // The queue admits a single committing leader; Close drains it before
+  // changing the WAL or active MemTable. No separate write mutex is needed.
+  detail::WriteQueue<Status> writers_;
   std::thread background_worker_;
   std::condition_variable background_cv_;
   bool background_stop_ = false;
@@ -169,10 +207,8 @@ class DB {
   Status background_status_;
   // Serialize Open/Close across the worker join without blocking the worker.
   mutable std::mutex lifecycle_mu_;
-  mutable std::mutex write_mu_;
   mutable std::mutex compaction_mu_;
   mutable std::mutex version_mu_;
-  mutable std::shared_mutex memtable_mu_;
   mutable std::mutex bg_mu_;
 };
 

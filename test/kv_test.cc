@@ -759,6 +759,48 @@ void TestSSTableBlockChecksumCorruption() {
   std::filesystem::remove_all(db_path);
 }
 
+void TestSSTableKeyRangeReads() {
+  const auto path = TestDBPath("test_db_key_ranges");
+  std::filesystem::remove_all(path);
+  std::filesystem::create_directories(path);
+  kv::VersionEdit edit;
+  edit.wal_file_number = 4;
+  edit.next_file_number = 5;
+  edit.last_sequence = 6;
+  const std::vector<std::vector<kv::VersionedEntry>> tables = {
+      {{"a", 1, "old_a", false}, {"c", 2, "old_c", false}},
+      {{"a", 4, "new_a", false}, {"c", 5, "", true}},
+      {{"x", 3, "value_x", false}, {"z", 6, "value_z", false}}};
+  for (size_t i = 0; i < tables.size(); ++i) {
+    kv::SSTableMeta meta;
+    meta.file_number = i + 1;
+    meta.file_path = path / kv::SSTableFileName(meta.file_number);
+    meta.smallest_key = tables[i].front().key;
+    meta.largest_key = tables[i].back().key;
+    MustOK(kv::SSTable::CreateFromEntries(meta.file_path, tables[i]));
+    meta.file_size = std::filesystem::file_size(meta.file_path);
+    edit.sstables.push_back(std::move(meta));
+  }
+  kv::Manifest manifest(path);
+  MustOK(manifest.Save(edit));
+  kv::DB db(path);
+  MustOK(db.Open());
+  std::string value;
+  const auto before = db.Stats();
+  for (const auto* key : {"0", "q", "~"}) {
+    CHECK(db.Get(key, &value).IsNotFound());
+  }
+  CHECK(db.Stats().bloom_filtered == before.bloom_filtered);
+  CHECK(db.Stats().block_reads == before.block_reads);
+  MustOK(db.Get("a", &value)); CHECK(value == "new_a");
+  CHECK(db.Get("c", &value).IsNotFound());
+  MustOK(db.Get("x", &value)); CHECK(value == "value_x");
+  MustOK(db.Get("z", &value)); CHECK(value == "value_z");
+  CHECK(db.Stats().bloom_filtered == before.bloom_filtered);
+  MustOK(db.Close());
+  std::filesystem::remove_all(path);
+}
+
 void TestBloomFilterAndBlockCacheStats() {
   const std::filesystem::path db_path = TestDBPath("test_db_filter_cache");
   std::filesystem::remove_all(db_path);
@@ -773,9 +815,17 @@ void TestBloomFilterAndBlockCacheStats() {
   CHECK(WaitForSSTableCount(&db, 1));
 
   std::string value;
+  const auto before_missing = db.Stats();
   CHECK(db.Get("definitely_missing", &value).IsNotFound());
   kv::DBStats stats = db.Stats();
-  CHECK(stats.bloom_filtered > 0);
+  CHECK(stats.bloom_filtered == before_missing.bloom_filtered);
+  CHECK(stats.block_reads == before_missing.block_reads);
+  // This missing key lies within the table's bounds and reaches its Bloom filter.
+  for (size_t i = 0; i < 100 && stats.bloom_filtered == before_missing.bloom_filtered; ++i) {
+    CHECK(db.Get("bck1_missing_" + std::to_string(i), &value).IsNotFound());
+    stats = db.Stats();
+  }
+  CHECK(stats.bloom_filtered > before_missing.bloom_filtered);
 
   MustOK(db.Get("bc" + Key(10), &value));
   stats = db.Stats();
@@ -1678,6 +1728,7 @@ int main() {
   TestWALChecksumCorruption();
   TestBadSSTableMagicReturnsCorruption();
   TestSSTableBlockChecksumCorruption();
+  TestSSTableKeyRangeReads();
   TestBloomFilterAndBlockCacheStats();
   TestBlockSSTableMultipleBlocks();
   TestCompaction();

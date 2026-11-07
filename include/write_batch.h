@@ -27,6 +27,9 @@ class WriteBatch {
   void Delete(std::string key);
   void Clear();
   size_t Count() const;
+  size_t EncodedSize() const;
+  void Reserve(size_t operations);
+  void Append(const WriteBatch& batch);
   Status ValidateEncoding() const;
 
   std::string Encode() const;

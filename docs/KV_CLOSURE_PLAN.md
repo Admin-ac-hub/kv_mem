@@ -1,19 +1,22 @@
 # KV 主线工程收尾计划
 
-更新：2026-10-09。当前目标是冻结可复现、能解释的纯 KV 基线，用于一周后的面试准备。
-本文件记录已验证边界和后续待办；后续待办不是面试前必须完成的承诺。
+更新：2026-11-07。本文件记录纯 KV 的当前边界、并发模型、已验证结果与后续待办。
+2026-10-09 的基线和验收数字保留在历史小节。
 
 ## 当前范围与状态
 
 KV 主线包含 WAL/WriteBatch、SkipList MemTable、后台 Flush、SSTable/Bloom/Cache、
 Manifest/CURRENT、MVCC/Snapshot/Iterator 和简化 L0/L1/L2 Compaction。
-默认 `KV_ENABLE_VECTOR_EXTENSION=OFF`，核心只存字节；可选 VectorDB/HNSW 独立构建。
-模块分离和兼容证据见 [分离验收记录](KV_HNSW_SEPARATION_REPORT.md)。该记录里的
-5/11 个测试是分离时的历史结果；新增 core_boundary_test 后当前默认为 6 个，扩展为 12 个。
+当前使用 C++20，核心只存字节；默认 `KV_ENABLE_RPC=OFF`，可选 miniRPC 服务仅在 Linux 构建。
+2026-11-04 已移除 VectorDB/HNSW。模块分离证据见 [历史分离验收记录](KV_HNSW_SEPARATION_REPORT.md)，
+其中的扩展接口、测试数量与性能数字均保留当时口径。2026-11-07 纯 KV 的 CTest 项为 8 个。
 
 | 边界 | 当前实现与证据 |
 | --- | --- |
 | 生命周期 | Open/Close 串行，重复 Open 拒绝，重复 Close 允许，同对象可重开；关闭后新读/写/Compact 拒绝，空批次也检查状态 |
+| 写入串行化 | WriteQueue 只允许唯一组首执行提交；grouping 开/关均成立；Close 先停止准入并排空已接收请求，已移除 `write_mu_` |
+| MemTable 并发 | 单写者、多读者；原子后继 Release/Acquire 发布，不可变载荷和 Version 引用保证访问安全；已移除 `memtable_mu_` |
+| 批次可见性 | WAL 同步、整组节点安装后一次发布 `last_sequence_`；Get/Snapshot/Iterator 固定完整组边界，节点发布不单独推进可见性 |
 | Snapshot | 检查所属 DB、有效状态及 Open 周期；释放句柄保留到析构，但不保留历史版本 |
 | Iterator | 固定创建时读视图，SSTable 按块加载，MemTable 复制；已有 Iterator 可在 Close 后读 pin 的视图，应在 DB 销毁前释放 |
 | Options | 路径非空；MemTable/L0/L1/block 阈值为正，block_size 不超过 uint32；Bloom bits/key 为 1–64，cache=0 禁用 |
@@ -28,14 +31,39 @@ Manifest/CURRENT、MVCC/Snapshot/Iterator 和简化 L0/L1/L2 Compaction。
 [core_boundary_test.cc](../test/core_boundary_test.cc)。LOCK 使用现有 POSIX 平台能力，未增加 Windows 支持。
 目录锁为协作式锁；不要在实例存活时删除 LOCK、替换数据库目录或外部修改文件。
 
-## 本轮检查与验收
+## 2026-11-07 原子发布与去锁验证
+
+本轮线程锁从 8 把减至 6 把：DB 的 lifecycle、version、compaction、bg 四把，加上
+WriteQueue 与 BlockCache 各一把；目录 flock 另计。普通 Get 命中内存表无显式 mutex，
+常规写入组首涉及队列锁和版本锁；原子 shared_ptr 操作不保证底层无锁。
+当前锁职责与调用路径见 [README 并发模型](../README.md#并发模型)。
+
+- `skiplist_test`：多版本及墓碑、相同 internal key 的新节点替换、半批安装时读取旧视图、并发 Get/Entries/Size。
+- `read_version_test`：WAL/MANIFEST 同步期间读取、序号发布失败、三个写线程与 Snapshot/Iterator 并发，分别覆盖频繁切表和持续写 active 表。
+- `write_group_test`：FIFO 合并、错误与异常、序号预算，以及 grouping 开/关时的并发关闭排空。
+- `kv_test`、边界测试、公开 API 消费者测试、同步基准 smoke 和固定种子压力回归继续执行。
+
+本机 macOS arm64，AppleClang 21.0。下表复用本轮实现完成时的 CTest 原始日志；
+测试项、配置和源码摘要见 [metadata.json](benchmark_results/20261107-atomic-memtable/metadata.json)。
+
+| 配置 | CTest | 原始输出 |
+| --- | --- | --- |
+| Debug | 8/8 | [debug](benchmark_results/20261107-atomic-memtable/debug.txt) |
+| Release | 8/8 | [release](benchmark_results/20261107-atomic-memtable/release.txt) |
+| ASan + UBSan / Debug | 8/8 | [asan-ubsan](benchmark_results/20261107-atomic-memtable/asan-ubsan.txt) |
+| TSan / Debug | 8/8 | [tsan](benchmark_results/20261107-atomic-memtable/tsan.txt) |
+
+未观察到 sanitizer 报告；该结果覆盖已执行的路径。本轮未做吞吐对比，也未重跑 Linux RPC 集成，
+不能把旧 group commit 性能结果或 2026-11-04 的 RPC 测试结果归因于本次去锁。
+
+## 2026-10-09 边界修复验收（历史）
 
 新增回归覆盖非法/零配置、路径冲突与失败重试、关闭状态空批次、进程间锁与路径别名、
 并发 Open/Close、零序号 Snapshot、WAL 同步错误后恢复整批、Manifest 不确定发布保留文件、
 长文件编号/孤儿编号、重开缓存、序号重叠/溢出、巨大声明长度及部分非法元数据。
 原 Flush 测试已改为分别等待“发布 SSTable”和“清理 WAL”，二者存在合法异步窗口。
 
-本机 macOS arm64，AppleClang 21.0；最终源码回归结果如下，未观察到 Sanitizer 报告。
+当时本机 macOS arm64，AppleClang 21.0；该轮源码回归结果如下，未观察到 Sanitizer 报告。
 历史冻结基线见 [KV_BASELINE.md](KV_BASELINE.md)。各配置独立构建目录，测试耗时不用于性能比较。
 
 | 配置 | 模式 | CTest | 原始输出 |
@@ -56,7 +84,8 @@ ctest --test-dir build-kv-review --output-on-failure
 
 Release 改 `CMAKE_BUILD_TYPE=Release`；ASan/UBSan 用独立目录加
 `-DKV_SANITIZERS=address,undefined`，TSan 用独立目录加 `-DKV_SANITIZERS=thread`。
-扩展模式另加 `-DKV_ENABLE_VECTOR_EXTENSION=ON`。本地结果不代表远端 CI 已执行。
+当前源码不再支持 `KV_ENABLE_VECTOR_EXTENSION=ON`；历史扩展测试需要对应历史源码。
+本地结果不代表远端 CI 已执行。
 
 ## 必须保留的失败语义
 
@@ -69,12 +98,12 @@ MemTable 更新之后，不能据此认定未提交；完整 WAL 可能在重开
 有 Manifest 时以发布版本为准；Manifest/CURRENT 都缺失时的目录扫描是兼容路径，
 可能纳入孤儿表，不作为任意元数据丢失后的安全恢复保证。
 
-## 一周内执行范围
+## 材料维护范围
 
-1. 固定当前源码与构建结果，面试前只修可复现的阻塞问题。
+1. 保留当前源码与验证口径，按真实需求修复可复现问题。
 2. 对齐简历、README 和 [面试核心素材](interview_core.md)，不保留过时接口或目标性能数字。
 3. 准备读写/恢复图、Snapshot 与 tombstone 手推、一个真实并发 bug 和一个失败恢复案例。
-4. HNSW 仅作为附加能力，准备基本搜索、M/ef 参数、精确召回基线和与 KV 的分离边界。
+4. HNSW 仅作为历史设计与实验材料，不列作当前交付能力。
 
 ## 后续工程待办
 
@@ -84,6 +113,6 @@ MemTable 更新之后，不能据此认定未提交；完整 WAL 可能在重开
 - immutable 队列背压、大数据与长 Snapshot 内存/空间控制；输出目前全量物化。
 - Snapshot 裸指针句柄管理改进；释放句柄的数量随 DB 对象生命周期累积。
 - 启动孤儿文件清理及删除失败治理；核心不得清理扩展目录或历史侧索引。
-- writer queue、group commit、可配置 durability、Manifest 滚动和长期稳态 Benchmark。
+- 可配置 durability、Manifest 滚动和长期稳态 Benchmark；writer queue 与 group commit 已实现，去锁后的性能变化待测。
 
 上述任务按真实需求独立推进。本轮不推进分段 HNSW、并行构图、混合检索或百万向量验收。

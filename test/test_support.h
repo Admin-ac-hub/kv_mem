@@ -98,19 +98,4 @@ inline std::vector<std::filesystem::path> ListSSTables(const std::filesystem::pa
   return files;
 }
 
-inline std::vector<std::filesystem::path> ListHNSWIndexes(
-    const std::filesystem::path& db_path) {
-  std::vector<std::filesystem::path> files;
-  if (!std::filesystem::exists(db_path)) {
-    return files;
-  }
-  for (const auto& entry : std::filesystem::directory_iterator(db_path)) {
-    if (entry.is_regular_file() && entry.path().extension() == ".hnsw") {
-      files.push_back(entry.path());
-    }
-  }
-  std::sort(files.begin(), files.end());
-  return files;
-}
-
 }  // namespace

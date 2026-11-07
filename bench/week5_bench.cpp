@@ -214,34 +214,34 @@ int RunDBBench(const Args& args) {
   }
 
   const std::string value(args.value_size, 'x');
-  const auto begin = std::chrono::steady_clock::now();
   std::size_t completed = 0;
-  if (args.mode == "db-put") {
-    for (std::size_t i = 0; i < args.operations; ++i) {
-      status = db.Put("week5_key_" + std::to_string(i), value);
-      if (!status.ok()) {
-        break;
-      }
-      ++completed;
-    }
-  } else {
-    for (std::size_t first = 0; first < args.operations;) {
-      kv::WriteBatch batch;
-      const std::size_t count =
-          std::min(args.operations - first, args.batch_size);
-      const std::size_t end = first + count;
-      for (std::size_t i = first; i < end; ++i) {
-        batch.Put("week5_key_" + std::to_string(i), value);
-      }
-      status = db.Write(batch);
-      if (!status.ok()) {
-        break;
-      }
-      completed += end - first;
-      first = end;
-    }
-  }
-  const auto end = std::chrono::steady_clock::now();
+  std::atomic<std::size_t> successful{0};
+  std::mutex error_mu;
+  const auto concurrent = RunWorkers(args.operations, args.threads,
+      [&](std::size_t, std::size_t first, std::size_t count) {
+        for (std::size_t offset = 0; offset < count;) {
+          const std::size_t n = args.mode == "db-put" ? 1
+              : std::min(count - offset, args.batch_size);
+          kv::Status write_status;
+          if (args.mode == "db-put") {
+            write_status = db.Put("week5_key_" + std::to_string(first + offset), value);
+          } else {
+            kv::WriteBatch batch;
+            for (std::size_t j = 0; j < n; ++j) {
+              batch.Put("week5_key_" + std::to_string(first + offset + j), value);
+            }
+            write_status = db.Write(batch);
+          }
+          if (!write_status.ok()) {
+            std::lock_guard<std::mutex> lock(error_mu);
+            status = write_status;
+            return;
+          }
+          successful.fetch_add(n, std::memory_order_relaxed);
+          offset += n;
+        }
+      });
+  completed = successful.load();
   const kv::Status close_status = db.Close();
   if (status.ok() && !close_status.ok()) {
     status = close_status;
@@ -251,12 +251,12 @@ int RunDBBench(const Args& args) {
     return 1;
   }
 
-  const double elapsed_seconds = std::chrono::duration<double>(end - begin).count();
+  const double elapsed_seconds = concurrent.elapsed_seconds;
   const double ops_per_second =
       elapsed_seconds == 0.0 ? 0.0 : completed / elapsed_seconds;
   const double ns_per_operation =
       completed == 0 ? 0.0 : elapsed_seconds * 1000000000.0 / completed;
-  std::cout << args.mode << ',' << completed << ',' << 1 << ','
+  std::cout << args.mode << ',' << completed << ',' << std::min(args.threads, args.operations) << ','
             << args.batch_size << ',' << elapsed_seconds << ','
             << ops_per_second << ',' << ns_per_operation << ",n/a,n/a\n";
   return completed == args.operations ? 0 : 1;

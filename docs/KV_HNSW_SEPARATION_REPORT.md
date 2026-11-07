@@ -2,7 +2,7 @@
 
 日期：2026-10-09。实施计划：[KV_HNSW_SEPARATION_PLAN.md](KV_HNSW_SEPARATION_PLAN.md)。
 
-> 本文保留模块分离阶段的接口、测试数量和性能测量。随后完成的目录锁、配置校验、持久化失败及编号边界修复见 [KV 主线收尾计划](KV_CLOSURE_PLAN.md)；新增回归后测试数为纯 KV 6 个、扩展 12 个，本文性能数字未包含后续边界修复。
+> 历史验收：本文保留 2026-10-09 模块分离阶段的接口、测试数量和性能测量。其后曾增至纯 KV 6 个、扩展 12 个测试；2026-11-04 已移除 HNSW/VectorDB。2026-11-07 纯 KV 为 8 项测试，已移除 `write_mu_`、`memtable_mu_`，改为 WriteQueue 唯一组首和 SkipList 原子发布。当前锁职责见 [README 并发模型](../README.md#并发模型)，验证见 [当前验收记录](KV_CLOSURE_PLAN.md#2026-11-07-原子发布与去锁验证)。本文性能数字未包含这些后续变更。
 
 已完成同仓库模块分离，默认构建纯 KV；显式启用扩展后构建 VectorDB、编码/距离和
 HNSW。KV 的 WAL/MemTable/SSTable/Manifest/MVCC/后台维护算法保留，核心不再调用

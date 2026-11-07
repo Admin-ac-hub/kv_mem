@@ -138,6 +138,15 @@ void TestFileNumbersAndReopenCache() {
   std::uint64_t number = 0;
   CHECK(kv::ParseWALFileName(kv::WALFileName(1000000), &number) && number == 1000000);
   CHECK(kv::ParseSSTableFileName(kv::SSTableFileName(1000000), &number) && number == 1000000);
+  CHECK(kv::ParseWALFileName("wal_18446744073709551615.log", &number) &&
+        number == std::numeric_limits<std::uint64_t>::max());
+  CHECK(kv::ParseSSTableFileName("sst_000001.data", &number) && number == 1);
+  CHECK(!kv::ParseWALFileName("wal_00001.log", &number));
+  CHECK(!kv::ParseWALFileName("wal_00000x.log", &number));
+  CHECK(!kv::ParseWALFileName("xwal_000001.log", &number));
+  CHECK(!kv::ParseWALFileName("wal_000001.log.bak", &number));
+  CHECK(!kv::ParseSSTableFileName("wal_000001.data", &number));
+  CHECK(!kv::ParseSSTableFileName("sst_000001.log", &number));
   CHECK(!kv::ParseWALFileName("wal_18446744073709551616.log", &number));
   CHECK(!kv::ParseWALFileName("wal_000000.log", &number));
   const auto path = TestDBPath("boundary_numbers"); std::filesystem::remove_all(path);

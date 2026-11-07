@@ -1,9 +1,11 @@
 # 第五周：性能与未定义行为实验报告
 
+> 历史实验：下述结果对应实验环境表中的源码基线，早于 WriteQueue/group commit 和 2026-11-07 的原子 SkipList 去锁改动。当前每个非空提交组共享一次 WAL fsync，已移除 `write_mu_`、`memtable_mu_`，详见 [README 并发模型](../README.md#并发模型)。本报告的 batch 吞吐比不能作为去锁收益。
+
 ## 目标与结论
 
 本周把“性能更好”拆成可复现的数字，并确认优化没有引入未定义行为（UB）。
-在当前 Mini LSM-KV 中，最主要的真实性能成本是持久化路径：每次
+在本次实验的 Mini LSM-KV 版本中，最主要的真实性能成本是持久化路径：每次
 `DB::Write` 都会调用一次 `WALWriter::AppendBatch`，并在返回前执行 `fsync`。
 把多个操作放进同一个 `WriteBatch` 可以把这项固定成本摊薄；在本次机器和
 workload 上，batch size 32 的写入吞吐约为单条 `Put` 的 9.1 倍。

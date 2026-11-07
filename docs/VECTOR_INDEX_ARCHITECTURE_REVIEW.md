@@ -1,6 +1,6 @@
 # 向量索引架构方案评审
 
-> 2026-10-09 模块边界更新：当前实现为纯 `kv_core` + 可选 `vector_db`/`hnsw`；扩展每次打开从 KV 重建，KV 不维护索引文件。本文中的分段、持久化及旧 DB 向量接口描述属于历史设计或后续提案，实际接口以 README 和分离验收记录为准。
+> 历史评审：下文代码位置、持锁范围和测量均对应当时版本。2026-11-04 已移除 HNSW/VectorDB；2026-11-07 的 KV 已通过 WriteQueue 唯一组首与 SkipList 原子发布移除 `write_mu_`、`memtable_mu_`，WAL 同步不持版本锁。当前 6 把线程锁见 [README 并发模型](../README.md#并发模型)，本评审的旧串行段数字不能量化去锁收益。
 
 评审对象：`docs/VECTOR_INDEX_ARCHITECTURE.md`（2026-09-28，状态：设计提案，未实现）
 评审日期：2026-09-28
@@ -59,7 +59,7 @@
 
 ### 1.2 瓶颈诊断成立，且比方案说的更严重
 
-方案说「`write_mu_` 不再需要串行化图插入」。代码事实是 `DB::Write`（`src/db.cc:436-438`）**同时持有 `write_mu_` 和 `version_mu_` 两把全局互斥锁**，覆盖 WAL 追加、MemTable 更新、`MaybeFlushMemTable` 全过程。图插入（`MemTable::PutVector` → `HNSWIndex::InsertVersion`）在这个临界区内部。
+方案说「`write_mu_` 不再需要串行化图插入」。当时核对的代码是 `DB::Write`（旧 `src/db.cc:436-438`）**同时持有 `write_mu_` 和 `version_mu_` 两把全局互斥锁**，覆盖 WAL 追加、MemTable 更新、`MaybeFlushMemTable` 全过程。图插入（`MemTable::PutVector` → `HNSWIndex::InsertVersion`）在这个临界区内部。这是历史证据，当前写入路径见文首链接。
 
 所以「把图插入挪出临界区」之后，剩下的串行段是 WAL + MemTable + 可能的 flush 触发。方案 §8 承认了这点，但没有给出这个串行段任何实测数字 —— 见 V6。
 

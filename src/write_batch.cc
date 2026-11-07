@@ -36,8 +36,30 @@ size_t WriteBatch::Count() const {
   return operations_.size();
 }
 
+size_t WriteBatch::EncodedSize() const {
+  size_t bytes = 0;
+  for (const auto& operation : operations_) {
+    bytes +=
+        kOperationHeaderSize + operation.key.size() + operation.value.size();
+  }
+  return bytes;
+}
+
+void WriteBatch::Reserve(size_t operations) { operations_.reserve(operations); }
+
+void WriteBatch::Append(const WriteBatch& batch) {
+  if (this == &batch) {
+    const auto copy = operations_;
+    operations_.insert(operations_.end(), copy.begin(), copy.end());
+  } else {
+    operations_.insert(operations_.end(), batch.operations_.begin(),
+                       batch.operations_.end());
+  }
+}
+
 std::string WriteBatch::Encode() const {
   std::string encoded;
+  encoded.reserve(EncodedSize());
   for (const auto& operation : operations_) {
     encoded.push_back(static_cast<char>(operation.type));
     AppendFixed32(&encoded, static_cast<std::uint32_t>(operation.key.size()));

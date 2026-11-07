@@ -1,6 +1,7 @@
 #include "db.h"
 
 #include <algorithm>
+#include <exception>
 #include <filesystem>
 #include <fcntl.h>
 #include <sys/file.h>
@@ -41,7 +42,8 @@ Status ValidateKey(const std::string& key) {
 Status ValidateOptions(const Options& options) {
   if (options.db_path.empty()) return Status::InvalidArgument("db_path cannot be empty");
   if (options.memtable_entries_limit == 0 || options.level0_sstable_limit == 0 ||
-      options.level1_size_limit_bytes == 0 || options.block_size == 0 ||
+      options.level1_size_limit_bytes == 0 || options.write_group_max_bytes == 0 ||
+      options.block_size == 0 ||
       options.block_size > std::numeric_limits<std::uint32_t>::max()) {
     return Status::InvalidArgument("storage limits must be positive; block_size must fit uint32");
   }
@@ -302,7 +304,6 @@ DB::~DB() {
 
 Status DB::Open() {
   std::lock_guard<std::mutex> lifecycle(lifecycle_mu_);
-  std::lock_guard<std::mutex> write_lock(write_mu_);
   std::lock_guard<std::mutex> lock(version_mu_);
   if (!closed_) {
     return Status::InvalidArgument("database is already open");
@@ -320,6 +321,7 @@ Status DB::Open() {
     wal_.reset();
     ReleaseDirectoryLock();
   }
+  if (status.ok()) writers_.Start();
   return status;
 }
 
@@ -390,12 +392,13 @@ Status DB::OpenUnlocked() {
   ++lifecycle_generation_;
   closed_ = false;
   background_worker_ = std::thread(&DB::BackgroundWorkerLoop, this);
+  std::atomic_store_explicit(&read_version_, version_, std::memory_order_release);
   return Status::OK();
 }
 
 Status DB::Close() {
   std::lock_guard<std::mutex> lifecycle(lifecycle_mu_);
-  std::lock_guard<std::mutex> write_lock(write_mu_);
+  writers_.StopAndDrain();
   std::unique_lock<std::mutex> lock(version_mu_);
   if (closed_) {
     return background_status_;
@@ -403,8 +406,10 @@ Status DB::Close() {
 
   bool moved_active_memtable = false;
   {
-    std::unique_lock<std::shared_mutex> memtable_lock(memtable_mu_);
     if (active_memtable_ != nullptr && active_memtable_->Size() > 0) {
+      auto next = std::make_shared<Version>(*version_);
+      next->immutables.push_back(active_memtable_);
+      next->active = std::make_shared<MemTable>();
       if (wal_ != nullptr) {
         wal_->Close();
         wal_.reset();
@@ -412,7 +417,8 @@ Status DB::Close() {
       immutable_memtables_.push_back(
           ImmutableMemTable{std::move(active_memtable_),
                             active_memtable_oldest_wal_file_number_});
-      active_memtable_ = std::make_shared<MemTable>();
+      active_memtable_ = next->active;
+      PublishVersion(std::move(next));
       moved_active_memtable = true;
     } else if (wal_ != nullptr) {
       wal_->Close();
@@ -456,6 +462,8 @@ Status DB::Close() {
   }
   if (!status.ok()) SetBackgroundErrorLocked(status);
   closed_ = true;
+  std::atomic_store_explicit(&read_version_, std::shared_ptr<const Version>{},
+                             std::memory_order_release);
   for (auto& snapshot : snapshots_) {
     snapshot->active_ = false;
   }
@@ -464,70 +472,109 @@ Status DB::Close() {
 }
 
 Status DB::Write(const WriteBatch& batch) {
-  std::lock_guard<std::mutex> write_lock(write_mu_);
-  std::lock_guard<std::mutex> lock(version_mu_);
-
-  if (!background_status_.ok()) {
-    return background_status_;
-  }
-  if (closed_ || wal_ == nullptr) {
-    return Status::IOError("database is not open");
-  }
-  if (batch.Count() == 0) return Status::OK();
-  if (manifest_->NextFileNumber() == std::numeric_limits<std::uint64_t>::max()) {
-    return Status::InvalidArgument("file number range exhausted");
-  }
-  Status encoding_status = batch.ValidateEncoding();
-  if (!encoding_status.ok()) return encoding_status;
-  if (batch.Count() > std::numeric_limits<SequenceNumber>::max() - manifest_->LastSequence()) {
-    return Status::InvalidArgument("sequence number range exhausted");
-  }
-
+  if (!writers_.Accepting())
+    return Status::IOError("database is not open or is closing");
+  Status status = batch.ValidateEncoding();
+  if (!status.ok()) return status;
   for (const auto& operation : batch.Operations()) {
-    Status status = ValidateKey(operation.key);
+    status = ValidateKey(operation.key);
+    if (!status.ok()) return status;
+  }
+  return writers_.Submit(
+      batch, options_.enable_write_grouping, options_.write_group_max_bytes,
+      options_.testing_after_write_enqueue,
+      [this](const WriteBatch& group) { return WriteGroup(group); },
+      [](Status error) { return error; },
+      [this] {
+        return std::numeric_limits<SequenceNumber>::max() -
+               last_sequence_.load(std::memory_order_acquire);
+      });
+}
+
+Status DB::WriteGroup(const WriteBatch& batch) {
+  // Only the WriteQueue leader calls this; Close first stops and drains it.
+  std::unique_lock<std::mutex> lock(version_mu_);
+  bool wal_attempted = false;
+  try {
+    if (!background_status_.ok()) {
+      return background_status_;
+    }
+    if (closed_ || wal_ == nullptr) {
+      return Status::IOError("database is not open");
+    }
+    if (batch.Count() == 0) return Status::OK();
+    if (manifest_->NextFileNumber() ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      return Status::InvalidArgument("file number range exhausted");
+    }
+    const SequenceNumber previous_sequence =
+        last_sequence_.load(std::memory_order_relaxed);
+    if (batch.Count() > std::numeric_limits<SequenceNumber>::max() -
+                            previous_sequence) {
+      return Status::InvalidArgument("sequence number range exhausted");
+    }
+
+    const SequenceNumber first_sequence = previous_sequence + 1;
+    const SequenceNumber last_sequence = previous_sequence + batch.Count();
+    // Queue leadership keeps the WAL and active MemTable stable. Readers and
+    // metadata maintenance need not wait for this batch's WAL fsync.
+    lock.unlock();
+    wal_attempted = true;
+    Status status = wal_->AppendBatch(batch, first_sequence);
     if (!status.ok()) {
+      lock.lock();
+      // A complete record may already be on disk. Do not reuse its sequences.
+      if (!status.IsInvalidArgument()) SetBackgroundErrorLocked(status);
       return status;
     }
-    switch (operation.type) {
-      case WriteBatchOpType::kPut:
-      case WriteBatchOpType::kDelete:
-        break;
-      default:
-        return Status::InvalidArgument("unknown WriteBatch operation type");
-    }
-  }
 
-  const SequenceNumber first_sequence = manifest_->LastSequence() + 1;
-  Status status = wal_->AppendBatch(batch, first_sequence);
-  if (!status.ok()) {
-    // A complete record may already be on disk. Do not reuse its sequences.
-    if (!status.IsInvalidArgument()) SetBackgroundErrorLocked(status);
-    return status;
-  }
+    lock.lock();
+    ++wal_sync_count_;
+    wal_committed_operations_ += batch.Count();
+    max_wal_batch_operations_ =
+        std::max<std::uint64_t>(max_wal_batch_operations_, batch.Count());
+    lock.unlock();
 
-  {
-    std::unique_lock<std::shared_mutex> memtable_lock(memtable_mu_);
     SequenceNumber sequence = first_sequence;
     for (const auto& operation : batch.Operations()) {
       switch (operation.type) {
         case WriteBatchOpType::kPut:
-          status = active_memtable_->Put(operation.key, sequence,
-                                         operation.value);
+          status =
+              active_memtable_->Put(operation.key, sequence, operation.value);
           break;
         case WriteBatchOpType::kDelete:
           status = active_memtable_->Delete(operation.key, sequence);
           break;
       }
-      if (!status.ok()) {
-        return status;
-      }
-      manifest_->SetLastSequence(sequence);
+      if (!status.ok()) break;
       ++sequence;
     }
+    if (!status.ok()) {
+      lock.lock();
+      SetBackgroundErrorLocked(status);
+      return status;
+    }
+    if (options_.testing_before_sequence_publish) {
+      options_.testing_before_sequence_publish();
+    }
+    // Publish the entire group only after every entry is installed. Reads that
+    // acquire the previous sequence ignore all of the unpublished entries.
+    last_sequence_.store(last_sequence, std::memory_order_release);
 
+    lock.lock();
     status = MaybeFlushMemTable();
+    return status;
+  } catch (const std::exception& error) {
+    Status status = Status::IOError(error.what());
+    if (!lock.owns_lock()) lock.lock();
+    if (wal_attempted) SetBackgroundErrorLocked(status);
+    return status;
+  } catch (...) {
+    Status status = Status::IOError("unexpected commit exception");
+    if (!lock.owns_lock()) lock.lock();
+    if (wal_attempted) SetBackgroundErrorLocked(status);
+    return status;
   }
-  return status;
 }
 
 Status DB::Put(const std::string& key, const std::string& value) {
@@ -546,31 +593,16 @@ Status DB::Get(const std::string& key, std::string* value, const ReadOptions& op
   }
 
   SequenceNumber read_sequence = 0;
-  std::shared_ptr<MemTable> active;
-  std::vector<std::shared_ptr<MemTable>> immutable_memtables;
-  std::vector<std::shared_ptr<SSTable>> sstables;
-  {
-    std::lock_guard<std::mutex> lock(version_mu_);
-    status = ValidateReadOptions(options);
-    if (!status.ok()) {
-      return status;
-    }
-    read_sequence = ReadSequence(options);
-    active = active_memtable_;
-    immutable_memtables.reserve(immutable_memtables_.size());
-    for (const auto& immutable : immutable_memtables_) {
-      immutable_memtables.push_back(immutable.memtable);
-    }
-    sstables = sstables_;
-  }
+  std::shared_ptr<const Version> version;
+  status = PinReadVersion(options, &version, &read_sequence);
+  if (!status.ok()) return status;
 
   if (options_.testing_after_read_version_pin) {
     options_.testing_after_read_version_pin();
   }
 
   {
-    std::shared_lock<std::shared_mutex> memtable_lock(memtable_mu_);
-    auto entry = active->Get(key, read_sequence);
+    auto entry = version->active->Get(key, read_sequence);
     if (entry.has_value()) {
       if (entry->deleted) {
         return Status::NotFound("key deleted");
@@ -580,7 +612,7 @@ Status DB::Get(const std::string& key, std::string* value, const ReadOptions& op
       return Status::OK();
     }
 
-    for (auto it = immutable_memtables.rbegin(); it != immutable_memtables.rend(); ++it) {
+    for (auto it = version->immutables.rbegin(); it != version->immutables.rend(); ++it) {
       entry = (*it)->Get(key, read_sequence);
       if (entry.has_value()) {
         if (entry->deleted) {
@@ -598,11 +630,16 @@ Status DB::Get(const std::string& key, std::string* value, const ReadOptions& op
   bool have_visible = false;
   bool newest_deleted = false;
   SequenceNumber newest_sequence = 0;
-  for (auto it = sstables.rbegin(); it != sstables.rend(); ++it) {
+  for (auto it = version->sstables.rbegin(); it != version->sstables.rend(); ++it) {
+    // Range filtering uses metadata pinned with the table, outside version_mu_.
+    if ((!it->meta.smallest_key.empty() && key < it->meta.smallest_key) ||
+        (!it->meta.largest_key.empty() && key > it->meta.largest_key)) {
+      continue;
+    }
     bool found = false;
     SequenceNumber sequence = 0;
     std::string candidate;
-    status = (*it)->Get(key, read_sequence, &candidate, &found, &sequence);
+    status = it->table->Get(key, read_sequence, &candidate, &found, &sequence);
     if (!status.ok() && !status.IsNotFound()) {
       return status;
     }
@@ -633,7 +670,7 @@ Status DB::Compact() {
 }
 
 Status DB::CompactUnlocked() {
-  std::vector<std::shared_ptr<SSTable>> base_tables;
+  std::shared_ptr<const Version> base_version;
   std::vector<SSTableMeta> inputs;
   int target_level = 1;
   SequenceNumber min_snapshot = 0;
@@ -648,11 +685,11 @@ Status DB::CompactUnlocked() {
     if (!background_status_.ok()) {
       return background_status_;
     }
-    if (sstables_.empty()) {
+    if (version_->sstables.empty()) {
       return Status::OK();
     }
 
-    base_tables = sstables_;
+    base_version = version_;
     const auto& metas = manifest_->SSTables();
     auto add_overlapping = [&](int level, const SSTableMeta& range) {
       for (const auto& meta : metas) {
@@ -731,7 +768,8 @@ Status DB::CompactUnlocked() {
            " -> L" + std::to_string(target_level));
 
   std::vector<std::unique_ptr<InternalIterator>> compaction_inputs;
-  for (const auto& table : base_tables) {
+  for (const auto& entry : base_version->sstables) {
+    const auto& table = entry.table;
     if (input_numbers.find(table->FileNumber()) == input_numbers.end()) {
       continue;
     }
@@ -841,7 +879,7 @@ Status DB::CompactUnlocked() {
     options_.testing_before_compaction_publish();
   }
 
-  std::vector<std::shared_ptr<SSTable>> old_tables;
+  std::shared_ptr<const Version> old_version;
   {
     std::lock_guard<std::mutex> lock(version_mu_);
     if (closed_ || lifecycle_generation_ != generation) {
@@ -865,15 +903,14 @@ Status DB::CompactUnlocked() {
     }
 
     const VersionEdit publish_edit = manifest_->CurrentEdit();
-    old_tables = sstables_;
-    sstables_.erase(std::remove_if(
-                        sstables_.begin(), sstables_.end(),
-                        [&](const std::shared_ptr<SSTable>& table) {
-                          return input_numbers.find(table->FileNumber()) !=
-                                 input_numbers.end();
-                        }),
-                    sstables_.end());
-    sstables_.push_back(new_table);
+    auto next = std::make_shared<Version>(*version_);
+    next->sstables.erase(
+        std::remove_if(next->sstables.begin(), next->sstables.end(),
+                       [&](const Version::Table& entry) {
+                         return input_numbers.find(entry.table->FileNumber()) !=
+                                input_numbers.end();
+                       }),
+        next->sstables.end());
 
     std::vector<SSTableMeta> new_metas;
     for (const auto& meta : publish_edit.sstables) {
@@ -900,21 +937,24 @@ Status DB::CompactUnlocked() {
       new_meta.smallest_key = minmax.first->key;
       new_meta.largest_key = minmax.second->key;
     }
+    next->sstables.push_back({new_table, new_meta});
     new_metas.push_back(std::move(new_meta));
     manifest_->SetSSTables(std::move(new_metas));
     status = SaveManifest();
     if (!status.ok()) {
-      sstables_ = old_tables;
       manifest_->SetCurrentEdit(publish_edit);
       new_table.reset();
       // The appended edit may be durable despite a sync error. Retain its file.
       return status;
     }
 
+    old_version = version_;
+    PublishVersion(std::move(next));
     ++compaction_count_;
   }
 
-  for (const auto& table : old_tables) {
+  for (const auto& entry : old_version->sstables) {
+    const auto& table = entry.table;
     if (input_numbers.find(table->FileNumber()) != input_numbers.end()) {
       Status remove_status = RemoveFileIfExists(table->FilePath());
       if (!remove_status.ok()) {
@@ -931,9 +971,12 @@ Status DB::CompactUnlocked() {
 DBStats DB::Stats() const {
   std::lock_guard<std::mutex> lock(version_mu_);
   DBStats stats;
-  stats.sstable_count = sstables_.size();
+  stats.sstable_count = version_ == nullptr ? 0 : version_->sstables.size();
   stats.compaction_count = compaction_count_;
   stats.flush_count = flush_count_;
+  stats.wal_sync_count = wal_sync_count_;
+  stats.wal_committed_operations = wal_committed_operations_;
+  stats.max_wal_batch_operations = max_wal_batch_operations_;
   stats.sstable_full_scans = sstable_full_scans_;
   for (const auto& meta : manifest_->SSTables()) {
     if (meta.level == 0) {
@@ -949,10 +992,12 @@ DBStats DB::Stats() const {
     stats.cache_hits = cache_stats.hits;
     stats.cache_misses = cache_stats.misses;
   }
-  for (const auto& table : sstables_) {
-    stats.bloom_filtered += table->BloomFilteredCount();
-    stats.block_reads += table->BlockReadCount();
-    stats.block_restart_seeks += table->RestartSeekCount();
+  if (version_ != nullptr) {
+    for (const auto& entry : version_->sstables) {
+      stats.bloom_filtered += entry.table->BloomFilteredCount();
+      stats.block_reads += entry.table->BlockReadCount();
+      stats.block_restart_seeks += entry.table->RestartSeekCount();
+    }
   }
   return stats;
 }
@@ -1038,15 +1083,17 @@ Status DB::LoadOrRecoverManifest() {
 }
 
 Status DB::OpenSSTables() {
-  sstables_.clear();
+  auto next = std::make_shared<Version>();
+  next->active = active_memtable_;
   for (const auto& meta : manifest_->SSTables()) {
     std::shared_ptr<SSTable> table;
     Status status = SSTable::Open(meta.file_number, meta.file_path, block_cache_, &table);
     if (!status.ok()) {
       return status;
     }
-    sstables_.push_back(std::move(table));
+    next->sstables.push_back({std::move(table), meta});
   }
+  PublishVersion(std::move(next));
   return Status::OK();
 }
 
@@ -1092,6 +1139,7 @@ Status DB::Recover() {
   }
 
   SequenceNumber last_replayed = 0;
+  SequenceNumber recovered_sequence = manifest_->LastSequence();
   for (const auto& wal_file : wal_files) {
     LogEvent("recovery replay WAL " + wal_file.second.filename().string());
     WALReader reader(wal_file.second);
@@ -1127,14 +1175,13 @@ Status DB::Recover() {
         if (!status.ok()) {
           return status;
         }
-        if (sequence > manifest_->LastSequence()) {
-          manifest_->SetLastSequence(sequence);
-        }
         ++sequence;
       }
+      recovered_sequence = std::max(recovered_sequence, last_replayed);
     }
   }
 
+  last_sequence_.store(recovered_sequence, std::memory_order_release);
   return Status::OK();
 }
 
@@ -1150,6 +1197,9 @@ Status DB::FlushMemTable() {
     return Status::OK();
   }
 
+  auto next = std::make_shared<Version>(*version_);
+  next->immutables.push_back(active_memtable_);
+  next->active = std::make_shared<MemTable>();
   const VersionEdit old_edit = manifest_->CurrentEdit();
   const std::uint64_t old_wal_number = active_memtable_oldest_wal_file_number_;
   std::uint64_t new_wal_number = 0;
@@ -1174,10 +1224,11 @@ Status DB::FlushMemTable() {
     wal_->Close();
   }
   immutable_memtables_.push_back(ImmutableMemTable{active_memtable_, old_wal_number});
-  active_memtable_ = std::make_shared<MemTable>();
+  active_memtable_ = next->active;
   active_wal_file_number_ = new_wal_number;
   active_memtable_oldest_wal_file_number_ = new_wal_number;
   wal_ = std::move(new_wal);
+  PublishVersion(std::move(next));
   {
     std::lock_guard<std::mutex> bg_lock(bg_mu_);
     background_work_pending_ = true;
@@ -1244,8 +1295,9 @@ void DB::BackgroundWorkerLoop() {
         }
 
         const VersionEdit old_edit = manifest_->CurrentEdit();
-        const auto old_tables = sstables_;
-        sstables_.push_back(table);
+        auto next = std::make_shared<Version>(*version_);
+        next->sstables.push_back({table, table_meta});
+        next->immutables.erase(next->immutables.begin());
         std::vector<SSTableMeta> new_metas = old_edit.sstables;
         new_metas.push_back(table_meta);
         manifest_->SetSSTables(std::move(new_metas));
@@ -1257,13 +1309,13 @@ void DB::BackgroundWorkerLoop() {
 
         status = SaveManifest();
         if (!status.ok()) {
-          sstables_ = old_tables;
           manifest_->SetCurrentEdit(old_edit);
           SetBackgroundErrorLocked(status);
           continue;
         }
 
         immutable_memtables_.pop_front();
+        PublishVersion(std::move(next));
         ++flush_count_;
         oldest_live_wal_after_flush = next_live_wal;
         cleanup_obsolete_wals = true;
@@ -1365,9 +1417,37 @@ Status DB::MaybeCompact() {
   return Status::OK();
 }
 
-SequenceNumber DB::ReadSequence(const ReadOptions& options) const {
-  return options.snapshot == nullptr ? manifest_->LastSequence()
-                                     : options.snapshot->sequence();
+void DB::PublishVersion(std::shared_ptr<const Version> version) {
+  version_ = std::move(version);
+  if (!closed_) {
+    std::atomic_store_explicit(&read_version_, version_, std::memory_order_release);
+  }
+}
+
+Status DB::PinReadVersion(const ReadOptions& options,
+                         std::shared_ptr<const Version>* version,
+                         SequenceNumber* sequence) const {
+  if (options.snapshot != nullptr) {
+    // Snapshot handle validation and compaction's retention boundary share
+    // version_mu_. The ordinary read path does not acquire this mutex.
+    std::lock_guard<std::mutex> lock(version_mu_);
+    Status status = ValidateReadOptions(options);
+    if (!status.ok()) return status;
+    *version = version_;
+    *sequence = options.snapshot->sequence();
+    return Status::OK();
+  }
+
+  do {
+    *version = std::atomic_load_explicit(&read_version_, std::memory_order_acquire);
+    if (*version == nullptr) return Status::IOError("database is not open");
+    *sequence = last_sequence_.load(std::memory_order_acquire);
+    // A rotation between these loads may put newer sequences in a different
+    // MemTable; a compaction may discard history needed by an older sequence.
+    // Retry so the pinned sources and visibility boundary belong together.
+  } while (*version != std::atomic_load_explicit(&read_version_,
+                                               std::memory_order_acquire));
+  return Status::OK();
 }
 
 Status DB::ValidateReadOptions(const ReadOptions& options) const {
@@ -1389,7 +1469,7 @@ Status DB::ValidateReadOptions(const ReadOptions& options) const {
 SequenceNumber DB::MinActiveSnapshotSequence() const {
   SequenceNumber min_sequence = 0;
   for (const auto& snapshot : snapshots_) {
-    if (snapshot == nullptr || !snapshot->active_) {
+    if (!snapshot->active_) {
       continue;
     }
     if (min_sequence == 0 || snapshot->sequence() < min_sequence) {
@@ -1404,7 +1484,8 @@ const Snapshot* DB::GetSnapshot() {
   if (closed_) {
     return nullptr;
   }
-  snapshots_.push_back(std::unique_ptr<Snapshot>(new Snapshot(manifest_->LastSequence())));
+  snapshots_.push_back(std::unique_ptr<Snapshot>(
+      new Snapshot(last_sequence_.load(std::memory_order_acquire))));
   return snapshots_.back().get();
 }
 
@@ -1422,24 +1503,24 @@ void DB::ReleaseSnapshot(const Snapshot* snapshot) {
 }
 
 std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& options) {
-  std::lock_guard<std::mutex> lock(version_mu_);
-  Status status = ValidateReadOptions(options);
+  std::shared_ptr<const Version> version;
+  SequenceNumber read_sequence = 0;
+  Status status = PinReadVersion(options, &version, &read_sequence);
   if (!status.ok()) {
     return std::make_unique<Iterator>(std::make_unique<MemTableInternalIterator>(
         std::vector<VersionedEntry>{}, 0, status));
   }
-  const SequenceNumber read_sequence = ReadSequence(options);
   std::vector<std::unique_ptr<InternalIterator>> children;
 
-  for (const auto& table : sstables_) {
-    children.push_back(table->NewIterator(read_sequence));
+  for (const auto& entry : version->sstables) {
+    children.push_back(entry.table->NewIterator(read_sequence));
   }
-  for (const auto& immutable : immutable_memtables_) {
+  for (const auto& immutable : version->immutables) {
     children.push_back(std::make_unique<MemTableInternalIterator>(
-        immutable.memtable->Entries(), read_sequence, Status::OK()));
+        immutable->Entries(), read_sequence, Status::OK()));
   }
   children.push_back(std::make_unique<MemTableInternalIterator>(
-      active_memtable_->Entries(), read_sequence, Status::OK()));
+      version->active->Entries(), read_sequence, Status::OK()));
 
   return std::make_unique<Iterator>(
       std::make_unique<MergingInternalIterator>(std::move(children)));
@@ -1447,7 +1528,9 @@ std::unique_ptr<Iterator> DB::NewIterator(const ReadOptions& options) {
 
 Status DB::SaveManifest() {
   LogEvent("manifest edit append");
-  Status status = manifest_->Save(manifest_->CurrentEdit());
+  VersionEdit edit = manifest_->CurrentEdit();
+  edit.last_sequence = last_sequence_.load(std::memory_order_acquire);
+  Status status = manifest_->Save(edit);
   if (!status.ok()) SetBackgroundErrorLocked(status);
   return status;
 }

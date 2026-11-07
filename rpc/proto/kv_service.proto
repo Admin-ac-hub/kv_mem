@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package kv.rpc.wire;
+
+message GetRequest {
+  uint32 version = 1;
+  bytes key = 2;
+}
+
+message Operation {
+  enum Type {
+    UNSPECIFIED = 0;
+    PUT = 1;
+    DELETE = 2;
+  }
+  Type type = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+// Put/Delete use one operation of the corresponding type. Write accepts a batch.
+message WriteRequest {
+  uint32 version = 1;
+  repeated Operation operations = 2;
+}
+
+message Reply {
+  enum Code {
+    UNSPECIFIED = 0;
+    OK = 1;
+    NOT_FOUND = 2;
+    INVALID_ARGUMENT = 3;
+    IO_ERROR = 4;
+    CORRUPTION = 5;
+  }
+  enum CommitState {
+    NOT_APPLICABLE = 0;
+    NOT_COMMITTED = 1;
+    COMMITTED = 2;
+    UNKNOWN = 3;
+  }
+  uint32 version = 1;
+  Code code = 2;
+  string message = 3;
+  bytes value = 4;
+  CommitState commit_state = 5;
+}

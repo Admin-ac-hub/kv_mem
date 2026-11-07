@@ -1,7 +1,14 @@
 # Week 6 Vector Benchmark Report
 
-The runner now uses the optional `VectorDB` extension. Current module boundaries
-and validation are documented in [the separation report](KV_HNSW_SEPARATION_REPORT.md).
+> Historical report: the `VectorDB`/HNSW extension was removed on November 4, 2026.
+> On November 7, 2026, KV removed `write_mu_` and `memtable_mu_` in favor of a
+> single committing WriteQueue leader and atomic SkipList node publication.
+> These historical measurements do not quantify that change; see the
+> [current concurrency model](../README.md#并发模型) and
+> [validation record](KV_CLOSURE_PLAN.md#2026-11-07-原子发布与去锁验证).
+
+The runner used the optional `VectorDB` extension at the time. The historical
+module boundaries and validation are documented in [the separation report](KV_HNSW_SEPARATION_REPORT.md).
 
 ## Scope
 

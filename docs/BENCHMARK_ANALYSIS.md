@@ -49,11 +49,13 @@
 
 写入路径需要先把 batch 追加到 WAL 并 fsync，然后再写入 active MemTable。MemTable 达阈值后会切换成 immutable，由后台线程 flush 成 SSTable。因此写入吞吐主要受 WAL 持久化成本、MemTable 插入成本，以及后台 Flush/Compaction 是否跟得上影响。
 
-当前 benchmark 是单线程逐条写入，不能展示 group commit 的收益。如果后续实现多个 writer 聚合成一次 WAL fsync，写吞吐和平均延迟会是值得重点对比的指标。
+`kv_bench` 是单线程逐条写入，不能展示多个请求共享一次 WAL fsync 的收益。当前引擎已实现 WriteQueue/group commit，需使用 `group_commit_bench` 对比多写线程、grouping 开/关及真实请求延迟；历史测量见 [自动批量提交报告](GROUP_COMMIT_REPORT.md)。
+
+2026-11-07 起，写队列保证唯一组首提交，已移除额外的 `write_mu_`；SkipList 原子后继支持单写多读，已移除 `memtable_mu_`。普通 Get 命中内存表不拿显式 mutex，数据块访问仍涉及缓存锁，Snapshot 句柄仍涉及版本锁。若要评估这次改动，应对比并发点查与读写混合负载，记录排队时间、吞吐和尾延迟；目前只有正确性回归结果，不能据此声称性能提升。锁模型见 [README](../README.md#并发模型)，验证见 [当前验收记录](KV_CLOSURE_PLAN.md#2026-11-07-原子发布与去锁验证)。
 
 ### 顺序读和随机读
 
-点查路径会先查 active MemTable 和 immutable MemTable，再按新到旧查询 SSTable。进入 SSTable 后，会依次经过 Bloom Filter、内存 block index、Block Cache 和 DataBlock 解码。
+点查先原子固定 Version 与读序号，查询 active MemTable 和 immutable MemTable，再检查 SSTable 的范围与候选记录，并按最大可见 sequence 裁决，不能仅按文件顺序选版本。进入 SSTable 后，会经过 Bloom Filter、内存 block index、Block Cache 和 DataBlock 解码。
 
 顺序读通常更容易复用相邻 key 所在的 DataBlock，因此 Block Cache 更容易发挥作用。随机读更容易打散访问位置，如果 cache 未命中，就需要更多 block 读取；如果查询 miss 较多，Bloom Filter 可以直接过滤掉确定不存在的 SSTable，减少无效 block lookup。
 

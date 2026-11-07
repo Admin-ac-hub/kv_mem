@@ -24,10 +24,13 @@ run_bench() {
 run_bench --mode sync --operations "${SYNC_OPERATIONS}" \
   --threads "${SYNC_THREADS}" --batch-size "${BATCH_SIZE}"
 run_bench --mode db-put --operations "${OPERATIONS}" \
+  --threads "${THREADS}" \
   --value-size "${VALUE_SIZE}" --path "${RUN_ROOT}/db-put"
 run_bench --mode db-batch --operations "${OPERATIONS}" \
+  --threads "${THREADS}" \
   --batch-size 1 --value-size "${VALUE_SIZE}" --path "${RUN_ROOT}/db-batch-1"
 run_bench --mode db-batch --operations "${OPERATIONS}" \
+  --threads "${THREADS}" \
   --batch-size "${BATCH_SIZE}" --value-size "${VALUE_SIZE}" \
   --path "${RUN_ROOT}/db-batch-${BATCH_SIZE}"
 
