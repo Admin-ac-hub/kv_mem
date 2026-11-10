@@ -1,0 +1,46 @@
+syntax = "proto3";
+package kv.raft.wire;
+import "kv_service.proto";
+
+message Entry { uint64 term = 1; bytes batch = 2; }
+message State {
+  uint32 version = 1;
+  string identity = 2;
+  uint64 term = 3;
+  uint32 voted_for = 4;
+  uint64 commit = 5;
+  repeated Entry entries = 6;
+}
+message VoteRequest {
+  string cluster = 1;
+  uint64 term = 2;
+  uint32 candidate = 3;
+  uint64 last_index = 4;
+  uint64 last_term = 5;
+}
+message VoteReply { uint64 term = 1; bool granted = 2; }
+message AppendRequest {
+  string cluster = 1;
+  uint64 term = 2;
+  uint32 leader = 3;
+  uint64 prev_index = 4;
+  uint64 prev_term = 5;
+  repeated Entry entries = 6;
+  uint64 commit = 7;
+}
+message AppendReply { uint64 term = 1; bool success = 2; uint64 matched = 3; }
+message Info {
+  uint32 id = 1;
+  uint32 leader = 2;
+  uint64 term = 3;
+  bool is_leader = 4;
+  uint64 commit = 5;
+  uint64 last_index = 6;
+  string error = 7;
+}
+message ClientReply {
+  kv.rpc.wire.Reply result = 1;
+  uint32 leader = 2;
+  bool rejected = 3;
+}
+message ClientRequest { string cluster = 1; bytes payload = 2; }

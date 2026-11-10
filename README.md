@@ -23,6 +23,8 @@ Mini LSM-KV 是一个基于 C++20 实现的单机持久化 KV 存储引擎。项
 
 纯 KV 引擎可选链接相邻项目 miniRPC，提供单节点远程 `Get/Put/Delete/Write`。
 RPC 采用独立适配层，支持二进制 value、原子批次、明确的业务错误与写入结果状态。
+另有独立的固定三节点模式 `kv_cluster_server` / `kv_cluster_client`，提供 Raft 多数派复制、自动选主、故障切换和重启追赶。
+三节点使用独立数据目录，不能用三个单节点 `kv_server` 代替；启动方法和安全/容量边界见 [三节点集群](docs/THREE_NODE_CLUSTER.md)。
 2026-11-04 起移除 HNSW/VectorDB 的源码、构建目标及测试；原始设计和实验报告保留为历史记录。
 
 ## 系统架构
@@ -385,7 +387,7 @@ Iterator 和 Snapshot 都应在 DB 销毁前释放。
 - DataBlock 已保留编码类型，但当前只写入原始 payload，尚未接入 Snappy 或 Zstd。
 - immutable 队列尚无完整背压；Compaction 输出全量物化，慢维护和长 Snapshot 仍可能增加内存与空间占用。
 - 已覆盖恢复与故障注入场景，完整发布点断电矩阵、解码器模糊测试和长期稳态验证仍未完成。
-- RPC 为单节点服务，尚无 Raft、复制、分片、请求去重、TLS 或鉴权；默认绑定 loopback。
+- 原有 `kv_server` 仍是单节点；新增三节点模式使用 Raft，但固定成员、完整历史重写且上限 64 MiB，尚无快照压缩、分片、请求去重、TLS 或鉴权。详见 [三节点边界](docs/THREE_NODE_CLUSTER.md#第一版容量与部署边界)。
 - RPC 单 value 上限 1 MiB、序列化请求 payload 上限 1.5 MiB、单批次最多 4096 操作；本地 DB 不受这些 RPC 限制。
 - 写入超时或底层 I/O 错误可能对应已提交数据；客户端不自动重放写入。
 

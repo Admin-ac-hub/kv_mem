@@ -26,3 +26,32 @@ if(BUILD_TESTING)
     set_tests_properties(kv_rpc_integration_test PROPERTIES
         TIMEOUT 60 LABELS "rpc;integration" RESOURCE_LOCK kv_rpc_listener)
 endif()
+
+protobuf_generate_cpp(KV_RAFT_PROTO_SRCS KV_RAFT_PROTO_HDRS proto/raft.proto)
+add_library(kv_raft
+    ${KV_RAFT_PROTO_SRCS} ${KV_RAFT_PROTO_HDRS}
+    src/raft_store.cc src/raft_transport.cc src/raft_node.cc
+    src/raft_service.cc src/raft_client.cc)
+target_include_directories(kv_raft PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(kv_raft PUBLIC kv_rpc)
+target_compile_options(kv_raft PRIVATE -Wall -Wextra -Wpedantic)
+foreach(app kv_cluster_server kv_cluster_client)
+    add_executable(${app} apps/${app}.cc)
+    target_link_libraries(${app} PRIVATE kv_raft)
+    target_compile_options(${app} PRIVATE -Wall -Wextra -Wpedantic)
+endforeach()
+if(BUILD_TESTING)
+    add_executable(raft_test test/raft_test.cc)
+    target_link_libraries(raft_test PRIVATE kv_raft)
+    target_include_directories(raft_test PRIVATE "${PROJECT_SOURCE_DIR}/test")
+    target_compile_definitions(raft_test PRIVATE KV_TEST_DB_ROOT="${CMAKE_CURRENT_BINARY_DIR}/test_dbs")
+    add_test(NAME raft_test COMMAND raft_test)
+    set_tests_properties(raft_test PROPERTIES TIMEOUT 60 LABELS "rpc;raft" RESOURCE_LOCK kv_raft_listener)
+    add_executable(cluster_process_test test/cluster_process_test.cc)
+    target_link_libraries(cluster_process_test PRIVATE kv_raft)
+    add_dependencies(cluster_process_test kv_cluster_server kv_cluster_client)
+    target_compile_options(cluster_process_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME cluster_process_test COMMAND cluster_process_test $<TARGET_FILE:kv_cluster_server> $<TARGET_FILE:kv_cluster_client>)
+    set_tests_properties(cluster_process_test PROPERTIES TIMEOUT 90 LABELS "rpc;raft;integration")
+endif()

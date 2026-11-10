@@ -127,12 +127,14 @@ CMake 3.28.3，Protobuf 3.21.12；使用两个仓库当前工作区，包含既�
 | CLI SIGTERM 停机后重启读取与删除持久化 | 通过 |
 | RPC OFF 且禁用 Protobuf/miniRPC 查找的配置 | 通过，纯 KV 不触发这些依赖查找 |
 
-这些结果不代表多机测试、性能基准或远端 CI 已执行。当前 CI 继续验证纯 KV；
-RPC 组合验证使用上述脚本和相邻 miniRPC 源码。
+这些结果不代表多机测试、性能基准或远端 CI 已执行。CI 另有 Linux Debug/Release 集群任务，
+固定 miniRPC 提交 `a33956ae10647d6c6a1b3d723c4d297f600ab7aa`，开启 `KV_ENABLE_RPC=ON`，运行全部 core/RPC/Raft CTest。
+本地组合验证仍可使用上述脚本和相邻 miniRPC 源码。
 
-当前不提供复制、Raft、分片、远程 Snapshot/Iterator、TLS 或鉴权。默认监听 loopback，
-外网部署需要另行设计访问控制。后续 Raft 可放在 KVService 和 DB 之间，保持
-“提交日志后再应用”的顺序，并为节点间 RPC 使用独立调度资源。
+本文所述的单节点 `kv_server` 不提供复制、Raft、分片、远程 Snapshot/Iterator、TLS 或鉴权。
+新增的固定三节点模式使用独立程序 `kv_cluster_server` / `kv_cluster_client`，实现 Raft 多数派复制及自动切主，
+业务与节点间 RPC 使用独立服务端线程池；见 [三节点集群](THREE_NODE_CLUSTER.md)。
+两种模式均未提供 TLS/鉴权，外网部署需要另行设计访问控制。
 
 ## HNSW 退役
 

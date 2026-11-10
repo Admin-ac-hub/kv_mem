@@ -14,6 +14,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux-cluster:
+    name: Linux RPC cluster / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kv
+      - uses: actions/checkout@v4
+        with:
+          repository: Admin-ac-hub/miniRPC
+          ref: a33956ae10647d6c6a1b3d723c4d297f600ab7aa
+          path: miniRPC
+      - name: Install Protobuf
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Build and install miniRPC
+        run: |
+          cmake -S miniRPC -B build-minirpc \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_STANDARD=20 \
+            -DMINIRPC_BUILD_TESTS=OFF -DMINIRPC_BUILD_EXAMPLES=OFF \
+            -DMINIRPC_BUILD_BENCHMARKS=OFF
+          cmake --build build-minirpc --parallel 2
+          cmake --install build-minirpc --prefix "${{ github.workspace }}/minirpc-prefix"
+      - name: Configure RPC and cluster
+        run: >-
+          cmake -S kv -B build-cluster
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DBUILD_TESTING=ON -DKV_ENABLE_RPC=ON
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/minirpc-prefix
+      - name: Build
+        run: cmake --build build-cluster --parallel 2
+      - name: Test core, RPC and cluster
+        run: ctest --test-dir build-cluster --no-tests=error --output-on-failure
+
   build-and-test:
     name: ${{ matrix.os }} / ${{ matrix.build_type }}
     strategy:
