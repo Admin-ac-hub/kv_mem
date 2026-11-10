@@ -387,7 +387,7 @@ Iterator 和 Snapshot 都应在 DB 销毁前释放。
 - DataBlock 已保留编码类型，但当前只写入原始 payload，尚未接入 Snappy 或 Zstd。
 - immutable 队列尚无完整背压；Compaction 输出全量物化，慢维护和长 Snapshot 仍可能增加内存与空间占用。
 - 已覆盖恢复与故障注入场景，完整发布点断电矩阵、解码器模糊测试和长期稳态验证仍未完成。
-- 原有 `kv_server` 仍是单节点；新增三节点模式使用 Raft，但固定成员、完整历史重写且上限 64 MiB，尚无快照压缩、分片、请求去重、TLS 或鉴权。详见 [三节点边界](docs/THREE_NODE_CLUSTER.md#第一版容量与部署边界)。
+- 原有 `kv_server` 仍是单节点；新增三节点模式使用 Raft，支持持久快照、日志压缩及落后副本分块安装，累计历史不再受原 64 MiB 上限限制；仍为固定成员，尚无分片、请求去重、TLS 或鉴权。详见 [三节点边界](docs/THREE_NODE_CLUSTER.md#容量与部署边界) 和 [快照验收](docs/RAFT_SNAPSHOTS.md)。
 - RPC 单 value 上限 1 MiB、序列化请求 payload 上限 1.5 MiB、单批次最多 4096 操作；本地 DB 不受这些 RPC 限制。
 - 写入超时或底层 I/O 错误可能对应已提交数据；客户端不自动重放写入。
 

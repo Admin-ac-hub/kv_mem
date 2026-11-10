@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include "kv_raft/client.h"
+#include "kv_raft/store.h"
 
 extern char** environ;
 using namespace std::chrono_literals;
@@ -96,12 +97,97 @@ void Value(kv::raft::Client& client, const std::string& key, const std::string& 
   const auto result = client.Get(key);
   Require(result.ok() && result.value == expected, ("wrong value: " + key + ": " + result.ToString()).c_str());
 }
+int SnapshotHistory(Cluster& cluster) {
+  for (unsigned id = 1; id <= 3; ++id) cluster.Start(id);
+  kv::raft::Client client(cluster.config);
+  unsigned leader = 0;
+  Wait([&] { leader = cluster.Leader(client); return leader != 0; }, "snapshot election timed out");
+  const auto laggard = leader % 3 + 1;
+  kv::WriteBatch batch;
+  batch.Put("deleted-by-history", "old");
+  batch.Put("binary-snapshot", std::string("a\0b", 3));
+  batch.Put("empty-snapshot", "");
+  batch.Put("large-snapshot", std::string(600000, 'B'));
+  Require(client.Write(batch).ok(), "snapshot seed failed");
+  const auto initial = client.Info(leader).commit();
+  Wait([&] { return client.Info(laggard).commit() >= initial; }, "laggard seed timed out");
+  cluster.Kill(laggard);
+  std::string expected;
+  std::uint64_t history = 0;
+  // 72 MiB of acknowledged mutations, while live state stays about 1.6 MiB.
+  for (unsigned i = 0; i < 72; ++i) {
+    expected.assign(1024 * 1024, static_cast<char>('A' + i % 26));
+    batch.Clear();
+    batch.Put("history", expected);
+    if (i == 0) batch.Delete("deleted-by-history");
+    const auto result = client.Write(batch);
+    Require(result.ok(), ("history write failed at " + std::to_string(i) + ": " + result.ToString()).c_str());
+    history += batch.EncodedSize();
+  }
+  Require(history > kv::raft::kMaxStateBytes, "history did not cross old ceiling");
+  leader = cluster.Leader(client);
+  const auto info = client.Info(leader);
+  Require(info.snapshot_index() > initial && info.applied_index() == info.commit(), "automatic snapshot did not run");
+  for (unsigned id = 1; id <= 3; ++id) if (id != laggard) {
+    const auto path = cluster.root / ("node" + std::to_string(id)) / "raft.state";
+    Require(std::filesystem::file_size(path) < 16 * 1024 * 1024, "retained log was not bounded");
+  }
+  Value(client, "history", expected);
+  Require(client.Get("deleted-by-history").status.IsNotFound(), "delete lost during snapshots");
+  cluster.Start(laggard);
+  const auto staging = cluster.root / ("node" + std::to_string(laggard)) / "install.tmp";
+  Wait([&] {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(staging, ec);
+    return !ec && size > 0;
+  }, "lagging replica never started snapshot installation");
+  cluster.Kill(laggard); // Interrupted multi-chunk transfer must retry from zero.
+  cluster.Start(laggard);
+  Wait([&] {
+    const auto follower = client.Info(laggard);
+    return follower.error().empty() && follower.snapshot_index() >= info.snapshot_index() &&
+        follower.commit() >= info.commit();
+  }, "replica failed to recover via snapshot after interrupted transfer");
+  batch.Clear(); batch.Put("after-snapshot-install", "replicated-tail");
+  Require(client.Write(batch).ok(), "write after snapshot install failed");
+  const auto final_commit = client.Info(cluster.Leader(client)).commit();
+  Wait([&] {
+    for (unsigned id = 1; id <= 3; ++id) if (client.Info(id).commit() < final_commit) return false;
+    return true;
+  }, "tail replication after install timed out");
+  for (unsigned id = 1; id <= 3; ++id) cluster.Kill(id);
+  for (unsigned id = 1; id <= 3; ++id) cluster.Start(id);
+  Wait([&] { return cluster.Leader(client) != 0; }, "snapshot full restart election timed out");
+  Value(client, "history", expected);
+  Value(client, "after-snapshot-install", "replicated-tail");
+  Require(client.Get("deleted-by-history").status.IsNotFound(), "deleted key revived after restart");
+  const auto restarted_commit = client.Info(cluster.Leader(client)).commit();
+  Wait([&] {
+    for (unsigned id = 1; id <= 3; ++id) if (client.Info(id).commit() < restarted_commit) return false;
+    return true;
+  }, "restarted replicas did not converge");
+  for (unsigned id = 1; id <= 3; ++id) cluster.Kill(id);
+  for (unsigned id = 1; id <= 3; ++id) {
+    kv::DB db(cluster.root / ("node" + std::to_string(id)) / "data");
+    Require(db.Open().ok(), "cannot inspect snapshot replica");
+    std::string value;
+    Require(db.Get("history", &value).ok() && value == expected, "replica history value mismatch");
+    Require(db.Get("deleted-by-history", &value).IsNotFound(), "replica revived deleted key");
+    Require(db.Get("binary-snapshot", &value).ok() && value == std::string("a\0b", 3), "replica binary mismatch");
+    Require(db.Get("empty-snapshot", &value).ok() && value.empty(), "replica empty value mismatch");
+    Require(db.Get("large-snapshot", &value).ok() && value == std::string(600000, 'B'), "replica large value mismatch");
+    Require(db.Get("after-snapshot-install", &value).ok() && value == "replicated-tail", "replica suffix missing");
+  }
+  std::cout << "PASS: " << history << " cumulative bytes, bounded log, interrupted TCP snapshot install, suffix and full restart\n";
+  return 0;
+}
 }
 int main(int argc, char** argv) {
-  if (argc != 3) return 2;
+  if (argc != 3 && argc != 4) return 2;
   Cluster cluster(argv[1]);
   std::cout << "Process logs: " << cluster.root << std::endl;
   try {
+    if (argc == 4) return SnapshotHistory(cluster);
     for (unsigned id = 1; id <= 3; ++id) cluster.Start(id);
     kv::raft::Client client(cluster.config);
     unsigned first = 0;

@@ -1,0 +1,111 @@
+10/13 Testing: raft_snapshot_test
+10/13 Test: raft_snapshot_test
+Command: "/tmp/kv-raft-20261110/build/rpc/raft_snapshot_test"
+Directory: /tmp/kv-raft-20261110/build/rpc
+"raft_snapshot_test" start time: Nov 10 06:26 UTC
+Output:
+----------------------------------------------------------
+node 1 fail-stop: IOError: injected snapshot.write
+node 1 fail-stop: IOError: injected snapshot.finish
+node 1 fail-stop: IOError: injected snapshot.fsync
+node 1 fail-stop: IOError: injected snapshot.rename
+node 1 fail-stop: IOError: injected snapshot.directory
+node 1 fail-stop: IOError: injected write
+node 1 fail-stop: IOError: injected fsync
+node 1 fail-stop: IOError: injected rename
+node 1 fail-stop: IOError: injected directory
+node 1 fail-stop: IOError: injected snapshot.cleanup
+node 1 fail-stop: IOError: injected snapshot.cleanup.directory
+PASS: generation, snapshot publication, log truncation and cleanup crash/I/O boundaries
+PASS: chunk CRC/order, interrupted transfer, idempotent install, stale snapshot and clean materialization
+PASS: install staging, publication and materialization crashes recover or retry
+PASS: suffix matching/discard, snapshot header/body/end corruption and missing-file rejection
+PASS: empty snapshot, maximum key/value records, no-op history compaction and snapshot voting boundary
+<end of output>
+Test time =  13.66 sec
+----------------------------------------------------------
+Test Passed.
+"raft_snapshot_test" end time: Nov 10 06:26 UTC
+"raft_snapshot_test" time elapsed: 00:00:13
+----------------------------------------------------------
+
+11/13 Testing: raft_test
+11/13 Test: raft_test
+Command: "/tmp/kv-raft-20261110/build/rpc/raft_test"
+Directory: /tmp/kv-raft-20261110/build/rpc
+"raft_test" start time: Nov 10 06:26 UTC
+Output:
+----------------------------------------------------------
+node 1 fail-stop: IOError: open raft.tmp: Is a directory
+PASS: write/fsync/rename/directory faults and fail-stop
+node 1 fail-stop: Corruption: attempt to overwrite committed entry
+PASS: conflicting tail replacement and committed-prefix protection
+PASS: replay committed history ahead of KV, including repeated overwrite/delete replay
+PASS: neither transport timeout nor UNKNOWN replays mutations
+node 1 leader term 1
+node 2 leader term 2
+PASS: isolated live old leader refuses success, majority wins, divergent tail repaired
+Raft vote/recovery/identity/corruption checks passed
+<end of output>
+Test time =   6.47 sec
+----------------------------------------------------------
+Test Passed.
+"raft_test" end time: Nov 10 06:27 UTC
+"raft_test" time elapsed: 00:00:06
+----------------------------------------------------------
+
+12/13 Testing: cluster_process_test
+12/13 Test: cluster_process_test
+Command: "/tmp/kv-raft-20261110/build/rpc/cluster_process_test" "/tmp/kv-raft-20261110/build/rpc/kv_cluster_server" "/tmp/kv-raft-20261110/build/rpc/kv_cluster_client"
+Directory: /tmp/kv-raft-20261110/build/rpc
+"cluster_process_test" start time: Nov 10 06:27 UTC
+Output:
+----------------------------------------------------------
+Process logs: "/tmp/kv-cluster-test.05OdOX"
+PASS: SIGKILL leader 1
+PASS: automatic failover and restarted replica catch-up
+PASS: paused old leader resumes safely
+PASS: one remaining node refuses successful reads/writes
+PASS: all three SIGKILL/restart retain acknowledged data
+<end of output>
+Test time =  11.94 sec
+----------------------------------------------------------
+Test Passed.
+"cluster_process_test" end time: Nov 10 06:27 UTC
+"cluster_process_test" time elapsed: 00:00:11
+----------------------------------------------------------
+
+13/13 Testing: cluster_snapshot_process_test
+13/13 Test: cluster_snapshot_process_test
+Command: "/tmp/kv-raft-20261110/build/rpc/cluster_process_test" "/tmp/kv-raft-20261110/build/rpc/kv_cluster_server" "/tmp/kv-raft-20261110/build/rpc/kv_cluster_client" "--snapshots"
+Directory: /tmp/kv-raft-20261110/build/rpc
+"cluster_snapshot_process_test" start time: Nov 10 06:27 UTC
+Output:
+----------------------------------------------------------
+Process logs: "/tmp/kv-cluster-test.QCJAlc"
+PASS: 75498651 cumulative bytes, bounded log, interrupted TCP snapshot install, suffix and full restart
+<end of output>
+Test time =  39.88 sec
+----------------------------------------------------------
+Test Passed.
+"cluster_snapshot_process_test" end time: Nov 10 06:27 UTC
+"cluster_snapshot_process_test" time elapsed: 00:00:39
+----------------------------------------------------------
+
+End testing: Nov 10 06:27 UTC
+
+benchmark =   0.00 sec*proc
+
+concurrency =   0.32 sec*proc
+
+core =   9.77 sec*proc
+
+integration =  52.54 sec*proc
+
+raft =  71.95 sec*proc
+
+rpc =  72.66 sec*proc
+
+snapshot =  53.54 sec*proc
+
+stress =   0.20 sec*proc

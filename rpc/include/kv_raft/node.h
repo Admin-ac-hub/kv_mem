@@ -15,13 +15,16 @@ namespace kv::raft {
 class Node {
  public:
   using Transport = std::function<minirpc::RpcResponse(unsigned, const char*, const std::string&)>;
-  Node(Config config, unsigned id, std::filesystem::path root, Transport transport = {});
+  Node(Config config, unsigned id, std::filesystem::path root, Transport transport = {},
+       std::function<Status(const char*)> before_io = {});
   ~Node();
   Status Open();
   void Start();
   void Stop();
   wire::VoteReply Vote(const wire::VoteRequest& request);
   wire::AppendReply Append(const wire::AppendRequest& request);
+  wire::InstallReply Install(const wire::InstallRequest& request);
+  Status TakeSnapshot();
   wire::Info Info();
   rpc::Result Execute(const WriteBatch* batch, const std::string& key = {});
  private:
@@ -31,6 +34,9 @@ class Node {
   std::uint64_t TermAt(std::uint64_t index) const;
   bool Persist();
   bool Apply();
+  bool Snapshot();
+  Status RebuildDB();
+  int Offset(std::uint64_t index) const;
   void Fail(Status status);
   void ResetDeadline();
   void ObserveTerm(std::uint64_t term);
@@ -52,6 +58,7 @@ class Node {
   std::array<bool, 3> votes_{};
   std::array<std::uint64_t, 3> next_{};
   std::array<std::uint64_t, 3> match_{};
+  std::array<std::uint64_t, 3> sending_snapshot_{}, sending_offset_{};
   Status error_;
   bool stopping_ = false;
   bool started_ = false;

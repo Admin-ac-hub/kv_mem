@@ -30,7 +30,7 @@ endif()
 protobuf_generate_cpp(KV_RAFT_PROTO_SRCS KV_RAFT_PROTO_HDRS proto/raft.proto)
 add_library(kv_raft
     ${KV_RAFT_PROTO_SRCS} ${KV_RAFT_PROTO_HDRS}
-    src/raft_store.cc src/raft_transport.cc src/raft_node.cc
+    src/raft_store.cc src/raft_snapshot.cc src/raft_transport.cc src/raft_node.cc
     src/raft_service.cc src/raft_client.cc)
 target_include_directories(kv_raft PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}")
@@ -42,6 +42,13 @@ foreach(app kv_cluster_server kv_cluster_client)
     target_compile_options(${app} PRIVATE -Wall -Wextra -Wpedantic)
 endforeach()
 if(BUILD_TESTING)
+    add_executable(raft_snapshot_test test/raft_snapshot_test.cc)
+    target_link_libraries(raft_snapshot_test PRIVATE kv_raft)
+    target_compile_options(raft_snapshot_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_include_directories(raft_snapshot_test PRIVATE "${PROJECT_SOURCE_DIR}/test")
+    target_compile_definitions(raft_snapshot_test PRIVATE KV_TEST_DB_ROOT="${CMAKE_CURRENT_BINARY_DIR}/test_dbs")
+    add_test(NAME raft_snapshot_test COMMAND raft_snapshot_test)
+    set_tests_properties(raft_snapshot_test PROPERTIES TIMEOUT 180 LABELS "rpc;raft;snapshot")
     add_executable(raft_test test/raft_test.cc)
     target_link_libraries(raft_test PRIVATE kv_raft)
     target_include_directories(raft_test PRIVATE "${PROJECT_SOURCE_DIR}/test")
@@ -54,4 +61,7 @@ if(BUILD_TESTING)
     target_compile_options(cluster_process_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME cluster_process_test COMMAND cluster_process_test $<TARGET_FILE:kv_cluster_server> $<TARGET_FILE:kv_cluster_client>)
     set_tests_properties(cluster_process_test PROPERTIES TIMEOUT 90 LABELS "rpc;raft;integration")
+    add_test(NAME cluster_snapshot_process_test COMMAND cluster_process_test
+        $<TARGET_FILE:kv_cluster_server> $<TARGET_FILE:kv_cluster_client> --snapshots)
+    set_tests_properties(cluster_snapshot_process_test PROPERTIES TIMEOUT 240 LABELS "rpc;raft;snapshot;integration")
 endif()

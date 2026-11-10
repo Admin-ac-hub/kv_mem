@@ -3,6 +3,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <sys/file.h>
 #include <unistd.h>
 #include "storage_util.h"
@@ -49,22 +50,29 @@ Status Store::Open(const std::string& identity, wire::State* state) {
   if (bytes.compare(0, 4, "KRF1") != 0 || DecodeFixed32(bytes.data() + 4) != payload.size() ||
       DecodeFixed32(bytes.data() + 8) != CRC32(payload) ||
       !state->ParseFromArray(payload.data(), static_cast<int>(payload.size())) ||
-      state->version() != 1 || state->identity() != identity ||
-      state->voted_for() > 3 || state->commit() > static_cast<std::uint64_t>(state->entries_size()))
+      (state->version() != 1 && state->version() != 2) || state->identity() != identity ||
+      state->voted_for() > 3 ||
+      state->snapshot_index() > std::numeric_limits<std::uint64_t>::max() - state->entries_size() ||
+      state->commit() < state->snapshot_index() ||
+      state->commit() > state->snapshot_index() + state->entries_size() ||
+      (state->snapshot_index() == 0) != (state->snapshot_term() == 0) ||
+      (state->snapshot_index() == 0) != (state->snapshot_bytes() == 0) ||
+      state->snapshot_term() > state->term() ||
+      (state->version() == 1 && state->snapshot_index() != 0))
     return Status::Corruption("raft checksum, identity or state invalid");
-  std::uint64_t previous = 0;
+  std::uint64_t previous = state->snapshot_term();
   for (const auto& entry : state->entries()) {
     if (entry.term() == 0 || entry.term() < previous || entry.term() > state->term())
       return Status::Corruption("invalid raft log term ordering");
     previous = entry.term();
   }
-  return Status::OK();
+  return state->snapshot_index() == 0 ? Status::OK() : ValidateSnapshot(*state);
 }
 
 Status Store::Save(const wire::State& state) {
   std::string payload;
   if (state.ByteSizeLong() > kMaxStateBytes)
-    return Status::IOError("64 MiB Raft history ceiling reached; snapshot compaction required");
+    return Status::IOError("retained Raft log exceeds 64 MiB");
   if (!state.SerializeToString(&payload)) return Status::IOError("serialize raft state");
   std::string bytes(12, '\0');
   bytes.replace(0, 4, "KRF1");
@@ -72,7 +80,7 @@ Status Store::Save(const wire::State& state) {
   EncodeFixed32(CRC32(payload), bytes.data() + 8);
   bytes += payload;
   const auto temp = root_ / "raft.tmp";
-  auto check = [&](const char* point) { return before_io ? before_io(point) : Status::OK(); };
+  auto check = [&](const char* point) { return Check(point); };
   auto status = check("write");
   if (!status.ok()) return status;
   const int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);

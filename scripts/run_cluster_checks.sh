@@ -6,4 +6,4 @@ if [[ ! -x "${BUILD_DIR}/rpc/kv_cluster_server" ]]; then
   echo "Build with KV_ENABLE_RPC=ON first, then pass the Linux build directory." >&2
   exit 2
 fi
-ctest --test-dir "${BUILD_DIR}" -R '^(raft_test|cluster_process_test)$' --output-on-failure
+ctest --test-dir "${BUILD_DIR}" -L raft --no-tests=error --output-on-failure

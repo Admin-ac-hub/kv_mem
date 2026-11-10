@@ -17,6 +17,7 @@ int main(int argc, char** argv) {
         const auto info = client.Info(id);
         std::cout << "node=" << id << " leader=" << info.leader() << " term=" << info.term()
                   << " committed=" << info.commit() << " last=" << info.last_index()
+                  << " applied=" << info.applied_index() << " snapshot=" << info.snapshot_index()
                   << " role=" << (info.is_leader() ? "leader" : "follower")
                   << " error=" << info.error() << '\n';
       }

@@ -1,0 +1,51 @@
+11/13 Testing: raft_test
+11/13 Test: raft_test
+Command: "/tmp/kv-raft-20261110/build-tsan/rpc/raft_test"
+Directory: /tmp/kv-raft-20261110/build-tsan/rpc
+"raft_test" start time: Nov 10 06:29 UTC
+Output:
+----------------------------------------------------------
+node 1 fail-stop: IOError: open raft.tmp: Is a directory
+PASS: write/fsync/rename/directory faults and fail-stop
+node 1 fail-stop: Corruption: attempt to overwrite committed entry
+PASS: conflicting tail replacement and committed-prefix protection
+PASS: replay committed history ahead of KV, including repeated overwrite/delete replay
+PASS: neither transport timeout nor UNKNOWN replays mutations
+node 3 leader term 1
+node 1 leader term 3
+PASS: isolated live old leader refuses success, majority wins, divergent tail repaired
+Raft vote/recovery/identity/corruption checks passed
+<end of output>
+Test time =   7.24 sec
+----------------------------------------------------------
+Test Passed.
+"raft_test" end time: Nov 10 06:29 UTC
+"raft_test" time elapsed: 00:00:07
+----------------------------------------------------------
+
+13/13 Testing: cluster_snapshot_process_test
+13/13 Test: cluster_snapshot_process_test
+Command: "/tmp/kv-raft-20261110/build-tsan/rpc/cluster_process_test" "/tmp/kv-raft-20261110/build-tsan/rpc/kv_cluster_server" "/tmp/kv-raft-20261110/build-tsan/rpc/kv_cluster_client" "--snapshots"
+Directory: /tmp/kv-raft-20261110/build-tsan/rpc
+"cluster_snapshot_process_test" start time: Nov 10 06:29 UTC
+Output:
+----------------------------------------------------------
+Process logs: "/tmp/kv-cluster-test.AxylK9"
+PASS: 75498651 cumulative bytes, bounded log, interrupted TCP snapshot install, suffix and full restart
+<end of output>
+Test time =  49.13 sec
+----------------------------------------------------------
+Test Passed.
+"cluster_snapshot_process_test" end time: Nov 10 06:30 UTC
+"cluster_snapshot_process_test" time elapsed: 00:00:49
+----------------------------------------------------------
+
+End testing: Nov 10 06:30 UTC
+
+integration =  49.13 sec*proc
+
+raft =  56.37 sec*proc
+
+rpc =  56.37 sec*proc
+
+snapshot =  49.13 sec*proc

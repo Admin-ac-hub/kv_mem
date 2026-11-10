@@ -51,6 +51,12 @@ void RegisterPeerService(minirpc::RpcServer& server, Node& node) {
       return Invalid(request);
     return Response(request, node.Append(body));
   });
+  server.RegisterService("Raft", "Install", [&node](const auto& request) {
+    wire::InstallRequest body;
+    if (request.payload.size() > kSnapshotChunkBytes + 4096 || !body.ParseFromString(request.payload))
+      return Invalid(request);
+    return Response(request, node.Install(body));
+  });
 }
 void RegisterClientService(minirpc::RpcServer& server, Node& node, const Config& config) {
   for (const char* method : {"Info", "Get", "Put", "Delete", "Write"}) {
