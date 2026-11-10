@@ -128,9 +128,15 @@ Debug 测试最初暴露“NotFound 被误当成换主重试”的服务层错�
 ## 2026-11-10 收口与 CI
 
 新增 `.github/workflows/ci.yml` 的 Linux RPC cluster Debug/Release 任务，安装 Protobuf、构建并安装固定提交
-`Admin-ac-hub/miniRPC@a33956ae10647d6c6a1b3d723c4d297f600ab7aa`，开启 `KV_ENABLE_RPC=ON`，运行全量 CTest。
+`Admin-ac-hub/miniRPC@35ab857c3bf2284524d287704a5f8ce599e3647a`，开启 `KV_ENABLE_RPC=ON`，运行全量 CTest。
 依赖使用已提交源码，不依赖相邻 miniRPC 工作区的未提交变更。
 
-本地在 `minirpc-linux`（Linux aarch64 / GCC 13.3 / Protobuf 3.21.12）从该固定依赖的干净源码构建，
+最初本地在 `minirpc-linux`（Linux aarch64 / GCC 13.3 / Protobuf 3.21.12）使用本地已提交但尚未推送的 miniRPC `a33956a` 干净源码构建，
 Debug 全量 **11/11 通过，31.15 秒**。构建目录为 `/tmp/kv-raft-20261110/build`。
 GitHub Actions 任务配置已加入；远端执行结果需推送后确认，本地结果不代表远端 CI 已通过。
+
+远端依赖可获取性检查发现 `a33956a` 尚未推送，CI 已改为远端 main 的固定提交 `35ab857`。
+集群传输显式设置 Protobuf 帧编码，不依赖后来本地提交改变的默认值；公开依赖复验结果另记。
+
+使用 `affb095` 的独立干净副本，仅补显式帧编码、链接公开依赖 `35ab857` 后，
+Linux Debug 全量 **11/11 通过，30.22 秒**；目录 `/tmp/kv-raft-20261110/checkpoint/build`。

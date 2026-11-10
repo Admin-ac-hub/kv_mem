@@ -128,7 +128,7 @@ CMake 3.28.3，Protobuf 3.21.12；使用两个仓库当前工作区，包含既�
 | RPC OFF 且禁用 Protobuf/miniRPC 查找的配置 | 通过，纯 KV 不触发这些依赖查找 |
 
 这些结果不代表多机测试、性能基准或远端 CI 已执行。CI 另有 Linux Debug/Release 集群任务，
-固定 miniRPC 提交 `a33956ae10647d6c6a1b3d723c4d297f600ab7aa`，开启 `KV_ENABLE_RPC=ON`，运行全部 core/RPC/Raft CTest。
+固定 miniRPC 提交 `35ab857c3bf2284524d287704a5f8ce599e3647a`，开启 `KV_ENABLE_RPC=ON`，运行全部 core/RPC/Raft CTest。
 本地组合验证仍可使用上述脚本和相邻 miniRPC 源码。
 
 本文所述的单节点 `kv_server` 不提供复制、Raft、分片、远程 Snapshot/Iterator、TLS 或鉴权。

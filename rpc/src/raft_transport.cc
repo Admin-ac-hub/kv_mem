@@ -116,6 +116,8 @@ minirpc::RpcResponse Exchange(const minirpc::Endpoint& endpoint,
         std::chrono::system_clock::now().time_since_epoch() + timeout).count();
     minirpc::ProtocolFrame frame;
     frame.request_id = 1;
+    frame.message_type = minirpc::MessageType::kRequest;
+    frame.codec_type = minirpc::CodecType::kProtobuf;
     frame.body = minirpc::EncodeRequestBody(request);
     minirpc::RpcCodec codec(2 * 1024 * 1024);
     const auto bytes = codec.Encode(frame);
